@@ -183,20 +183,12 @@ pub const InitialPacket = struct {
     token: []const u8,
 
     // not owning
-    sample: []const u8,
+    sample: *const [16]u8,
 
-    // not owning
-    header: []const u8,
-
-    // not owning
-    payload: []const u8,
-
+    protected_offset: usize,
     length: VLI,
-    mask: [5]u8,
-    pkt_number: u32,
-    secret: key.InitialSecret,
 
-    pub fn decodeFromSlice(buf: []u8, sent_by_server: bool, con_id: []const u8) !Self {
+    pub fn decodeFromSlice(buf: []u8, sent_by_server: bool) !Self {
         // decode as LHP
         const lhp = try LongHeaderPacket.decodeFromSlice(buf);
 
@@ -220,81 +212,57 @@ pub const InitialPacket = struct {
         const length_vli = VLI.decodeFromSlice(payload_slice[payload_idx..]);
         payload_idx += @intCast(length_vli.length);
 
-        const sample = payload_slice[payload_idx + 4 .. payload_idx + 4 + 16];
-        const secret = switch (sent_by_server) {
-            true => try key.InitialSecret.generate(con_id),
-            false => try key.InitialSecret.generate(lhp.destination_connection_id),
-        };
-
-        const aes128decoder = switch (sent_by_server) {
-            true => std.crypto.core.aes.Aes128.initEnc(secret.server_secret.hp),
-            false => std.crypto.core.aes.Aes128.initEnc(secret.client_secret.hp),
-        };
-
-        var headerProtectionKey = [_]u8{0} ** 16;
-        aes128decoder.encrypt(&headerProtectionKey, sample[0..16]);
-        const mask = headerProtectionKey[0..5];
-
-        // RFC9001 5.4.1. Header Protection Application
-        // pn_length = (packet[0] & 0x03) + 1
-        // if (packet[0] & 0x80) == 0x80:
-        //    # Long header: 4 bits masked
-        //    packet[0] ^= mask[0] & 0x0f
-        // else:
-        //    # Short header: 5 bits masked
-        //    packet[0] ^= mask[0] & 0x1f
-        if ((buf[0] & 0x80) == 0x80) {
-            buf[0] ^= mask[0] & 0xf;
-        } else {
-            buf[0] ^= mask[0] & 0x1f;
-        }
-        const pn_len = (buf[0] & 0x03) + 1;
-
-        var pn: u32 = 0;
-        const protected_payload = buf[lhp.length + payload_idx ..];
-        for (0..pn_len, mask[1 .. 1 + pn_len]) |i, m| {
-            protected_payload[i] ^= m;
-            pn = (pn << 8) | protected_payload[i];
-        }
-        const header = buf[0 .. lhp.length + payload_idx + pn_len];
-        const payload = buf[header.len..];
+        const sample = payload_slice[payload_idx + 4 .. payload_idx + 4 + 16][0..16];
 
         return Self{
             .lhp = lhp,
             .token = token,
             .length = length_vli,
             .sample = sample,
-            .mask = mask.*,
-            .pkt_number = pn,
-            .secret = secret,
-            .header = header,
-            .payload = payload,
+            .protected_offset = lhp.length + payload_idx,
         };
     }
 };
 
-pub fn PayloadDecryptor(comptime Aead: type) type {
-    return struct {
-        pub fn decrypt(m: []u8, c: []const u8, ad: []const u8, secret: key.AeadSecret(Aead), pkt_number: u32) ![]u8 {
-            // RFC9001 5.3. AEAD Usage
-            // The key and IV for the packet are computed as described in Section 5.1.
-            // The nonce, N, is formed by combining the packet protection IV with the packet number.
-            // The 62 bits of the reconstructed QUIC packet number in network byte order are left-padded with zeros to the size of the IV.
-            // The exclusive OR of the padded packet number and the IV forms the AEAD nonce.
-            // The associated data, A, for the AEAD is the contents of the QUIC header, starting from the first byte of either the short or long header, up to and including the unprotected packet number.
-            // The input plaintext, P, for the AEAD is the payload of the QUIC packet, as described in [QUIC-TRANSPORT].
-            // The output ciphertext, C, of the AEAD is transmitted in place of P.
-            var nonce = [_]u8{0} ** Aead.nonce_length;
-            std.mem.writeInt(u32, nonce[nonce.len - 4 ..], pkt_number, .big);
-            for (&nonce, secret.iv) |*n, i| {
-                n.* = n.* ^ i;
-            }
+const Aes128 = std.crypto.core.aes.Aes128;
+fn getHeaderProtectonMask(sample: *const [Aes128.block.block_length]u8, hp: [Aes128.key_bits / 8]u8) [5]u8 {
+    const enc = Aes128.initEnc(hp);
+    var headerProtectionKey = [_]u8{0} ** 16;
+    enc.encrypt(&headerProtectionKey, sample);
+    return headerProtectionKey[0..5].*;
+}
 
-            try key.InitialSecret.Aead.decrypt(m[0 .. c.len - Aead.tag_length], c[0 .. c.len - Aead.tag_length], c[c.len - Aead.tag_length ..][0..Aead.tag_length].*, ad, nonce, secret.key);
+fn unlockHeaderProtection(
+    buf: []u8,
+    protected_offset: usize,
+    pn_len: *usize,
+    pn: *u32,
+    sample: *const [Aes128.block.block_length]u8,
+    hp: [Aes128.key_bits / 8]u8,
+) void {
+    const mask = getHeaderProtectonMask(sample, hp);
+    if ((buf[0] & 0x80) == 0x80) {
+        buf[0] ^= mask[0] & 0xf;
+    } else {
+        buf[0] ^= mask[0] & 0x1f;
+    }
+    pn_len.* = (buf[0] & 0x03) + 1;
 
-            return m[0 .. c.len - Aead.tag_length];
-        }
-    };
+    for (0..pn_len.*, mask[1 .. 1 + pn_len.*]) |i, m| {
+        buf[protected_offset + i] ^= m;
+        pn.* = (pn.* << 8) | buf[protected_offset + i];
+    }
+}
+
+const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+fn getNonce(pkt_number: u32, iv: [Aes128Gcm.nonce_length]u8) [Aes128Gcm.nonce_length]u8 {
+    var nonce = [_]u8{0} ** Aes128Gcm.nonce_length;
+    std.mem.writeInt(u32, nonce[nonce.len - 4 ..], pkt_number, .big);
+    for (&nonce, iv) |*n, i| {
+        n.* = n.* ^ i;
+    }
+
+    return nonce;
 }
 
 const expect = std.testing.expect;
@@ -426,7 +394,7 @@ test "parse Client Initial Packet" {
     };
     // zig fmt: on
 
-    const pkt = try InitialPacket.decodeFromSlice(&client_msgs, false, &[_]u8{});
+    const pkt = try InitialPacket.decodeFromSlice(&client_msgs, false);
 
     try expect(pkt.lhp.version == 1);
     try expect(pkt.lhp.type_specific_bits == 0);
@@ -441,10 +409,7 @@ test "parse Client Initial Packet" {
     try expect(std.mem.eql(u8, pkt.sample, &sample_ans));
 
     const secret = try key.InitialSecret.generate(pkt.lhp.destination_connection_id);
-    const aes128decoder = std.crypto.core.aes.Aes128.initEnc(secret.client_secret.hp);
-    var headerProtectionKey = [_]u8{0} ** 16;
-    aes128decoder.encrypt(&headerProtectionKey, pkt.sample[0..16]);
-    const mask = headerProtectionKey[0..5];
+    const mask = getHeaderProtectonMask(pkt.sample[0..16], secret.client_secret.hp);
     const mask_ans = [_]u8{
         0x43,
         0x7B,
@@ -452,11 +417,20 @@ test "parse Client Initial Packet" {
         0xEC,
         0x36,
     };
-    try expect(std.mem.eql(u8, mask, &mask_ans));
-    try expect(pkt.pkt_number == 2);
+    try expect(std.mem.eql(u8, &mask, &mask_ans));
 
+    var pn_len: usize = 0;
+    var pn: u32 = 0;
+    unlockHeaderProtection(&client_msgs, pkt.protected_offset, &pn_len, &pn, pkt.sample, secret.client_secret.hp);
+    try expect(pn_len == 4);
+    try expect(pn == 2);
+
+    const nonce = getNonce(pn, secret.client_secret.iv);
     var m = [_]u8{0} ** 1500;
-    _ = try PayloadDecryptor(key.InitialSecret.Aead).decrypt(&m, pkt.payload, pkt.header, pkt.secret.client_secret, pkt.pkt_number);
+    const payload = client_msgs[pkt.protected_offset + pn_len ..];
+    try Aes128Gcm.decrypt(m[0 .. payload.len - Aes128Gcm.tag_length], payload[0 .. payload.len - Aes128Gcm.tag_length], payload[payload.len - Aes128Gcm.tag_length ..][0..Aes128Gcm.tag_length].*, client_msgs[0 .. pkt.protected_offset + pn_len], nonce, secret.client_secret.key);
+
+    //_ = try PayloadDecryptor(key.InitialSecret.Aead).decrypt(&m, pkt.payload, pkt.header, pkt.secret.client_secret, pkt.pkt_number);
 }
 
 test "parse Server Initial Packet" {
@@ -479,8 +453,16 @@ test "parse Server Initial Packet" {
     };
 
     const dst_con_id = [_]u8{ 0x83, 0x94, 0xC8, 0xF0, 0x3E, 0x51, 0x57, 0x08 };
-    const pkt = try InitialPacket.decodeFromSlice(&recv_msg, true, &dst_con_id);
+    const pkt = try InitialPacket.decodeFromSlice(&recv_msg, true);
+    const secret = try key.InitialSecret.generate(&dst_con_id);
+    var pn_len: usize = 0;
+    var pn: u32 = 0;
+    unlockHeaderProtection(&recv_msg, pkt.protected_offset, &pn_len, &pn, pkt.sample, secret.server_secret.hp);
+    try expect(pn_len == 2);
+    try expect(pn == 1);
+
+    const nonce = getNonce(pn, secret.server_secret.iv);
     var m = [_]u8{0} ** 1500;
-    try expect(pkt.pkt_number == 1);
-    _ = try PayloadDecryptor(key.InitialSecret.Aead).decrypt(&m, pkt.payload, pkt.header, pkt.secret.server_secret, pkt.pkt_number);
+    const payload = recv_msg[pkt.protected_offset + pn_len ..];
+    try Aes128Gcm.decrypt(m[0 .. payload.len - Aes128Gcm.tag_length], payload[0 .. payload.len - Aes128Gcm.tag_length], payload[payload.len - Aes128Gcm.tag_length ..][0..Aes128Gcm.tag_length].*, recv_msg[0 .. pkt.protected_offset + pn_len], nonce, secret.server_secret.key);
 }
