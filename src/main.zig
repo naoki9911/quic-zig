@@ -1,11 +1,9 @@
 const std = @import("std");
-const packet = @import("packet.zig");
 
-pub fn main() !void {
-    const buf = [_]u8{};
-    _ = try packet.InitialPacket.decodeFromSlice(&buf);
-}
+pub fn main() !void {}
 
 test {
+    _ = @import("packet.zig");
+    _ = @import("key.zig");
     std.testing.refAllDecls(@This());
 }
