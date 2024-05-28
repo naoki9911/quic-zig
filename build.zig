@@ -36,8 +36,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    exe.root_module.addAnonymousImport("tls13-crypto", .{
-        .root_source_file = .{ .path = "../tls13-zig/src/crypto.zig" },
+    exe.root_module.addAnonymousImport("tls13", .{
+        .root_source_file = .{ .path = "../tls13-zig/src/lib.zig" },
     });
 
     // This declares intent for the executable to be installed into the
@@ -83,8 +83,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    exe_unit_tests.root_module.addAnonymousImport("tls13-crypto", .{
-        .root_source_file = .{ .path = "../tls13-zig/src/crypto.zig" },
+    exe_unit_tests.root_module.addAnonymousImport("tls13", .{
+        .root_source_file = .{ .path = "../tls13-zig/src/lib.zig" },
     });
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);

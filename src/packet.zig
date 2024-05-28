@@ -1,5 +1,6 @@
 const std = @import("std");
 const key = @import("key.zig");
+const tls13 = @import("tls13");
 
 /// RFC9000 Section 16. Variable-Length Integer Encoding
 ///
@@ -224,6 +225,297 @@ pub const InitialPacket = struct {
     }
 };
 
+/// RFC9000 12.4. Frames and Frame Types
+///
+/// Type Value	Frame Type Name	Definition	Pkts	Spec
+/// 0x00	PADDING	Section 19.1	IH01	NP
+/// 0x01	PING	Section 19.2	IH01
+/// 0x02-0x03	ACK	Section 19.3	IH_1	NC
+/// 0x04	RESET_STREAM	Section 19.4	__01
+/// 0x05	STOP_SENDING	Section 19.5	__01
+/// 0x06	CRYPTO	Section 19.6	IH_1
+/// 0x07	NEW_TOKEN	Section 19.7	___1
+/// 0x08-0x0f	STREAM	Section 19.8	__01	F
+/// 0x10	MAX_DATA	Section 19.9	__01
+/// 0x11	MAX_STREAM_DATA	Section 19.10	__01
+/// 0x12-0x13	MAX_STREAMS	Section 19.11	__01
+/// 0x14	DATA_BLOCKED	Section 19.12	__01
+/// 0x15	STREAM_DATA_BLOCKED	Section 19.13	__01
+/// 0x16-0x17	STREAMS_BLOCKED	Section 19.14	__01
+/// 0x18	NEW_CONNECTION_ID	Section 19.15	__01	P
+/// 0x19	RETIRE_CONNECTION_ID	Section 19.16	__01
+/// 0x1a	PATH_CHALLENGE	Section 19.17	__01	P
+/// 0x1b	PATH_RESPONSE	Section 19.18	___1	P
+/// 0x1c-0x1d	CONNECTION_CLOSE	Section 19.19	ih01	N
+/// 0x1e	HANDSHAKE_DONE	Section 19.20	___1
+pub const FrameType = enum(u8) {
+    padding = 0x00,
+    //Ping = 0x01,
+    ack = 0x02,
+    ackECN = 0x03,
+    //ResetStream = 0x4,
+    //StopSending = 0x5,
+    crypto = 0x06,
+    //NewToken = 0x07,
+    //Stream1 = 0x8,
+    //Stream2 = 0x9,
+    //Stream3 = 0xa,
+    //Stream4 = 0xb,
+    //Stream5 = 0xc,
+    //Stream6 = 0xd,
+    //Stream7 = 0xe,
+    //Stream8 = 0xf,
+    //MaxData = 0x10,
+    //MaxStreamData = 0x11,
+    //MAxStreams1 = 0x12,
+    //MAxStreams2 = 0x13,
+    //DataBlocked = 0x14,
+    //StreamDataBlocked = 0x15,
+    //StreamsBlocked1 = 0x16,
+    //StreamsBlocked2 = 0x17,
+    //NewConnectionID = 0x18,
+    //RetireConnectionID = 0x19,
+    //PathChallenge = 0x1a,
+    //PathResponse = 0x1b,
+    //ConnectionClose1 = 0x1c,
+    //ConnectionClose2 = 0x1d,
+    //HandshakeDone = 0x1e,
+};
+
+pub const Frame = union(FrameType) {
+    const Self = @This();
+    padding: PaddingFrame,
+    ack: AckFrame,
+    ackECN: AckFrame,
+    crypto: CryptoFrame,
+
+    pub fn decodeFromSlice(buf: []const u8) Self {
+        const type_vli = VLI.decodeFromSlice(buf);
+        const t: u8 = @intCast(type_vli.value & 0xFF);
+        const frame_type: FrameType = @enumFromInt(t);
+
+        switch (frame_type) {
+            .padding => return Self{
+                .padding = PaddingFrame.decodeFromSlice(buf),
+            },
+            .ack => return Self{
+                .ack = AckFrame.decodeFromSlice(buf),
+            },
+            .ackECN => return Self{
+                .ackECN = AckFrame.decodeFromSlice(buf),
+            },
+            .crypto => return Self{
+                .crypto = CryptoFrame.decodeFromSlice(buf),
+            },
+        }
+    }
+
+    pub fn length(self: Self) usize {
+        switch (self) {
+            inline else => |case| return case.length(),
+        }
+    }
+};
+
+/// RFC9000 19.1. PADDING Frames
+///
+/// PADDING Frame {
+///   Type (i) = 0x00,
+/// }
+pub const PaddingFrame = struct {
+    const Self = @This();
+
+    len: usize,
+    pub fn decodeFromSlice(buf: []const u8) Self {
+        var len: usize = 0;
+        for (buf) |b| {
+            if (b == 0) {
+                len += 1;
+            } else {
+                break;
+            }
+        }
+
+        return Self{ .len = len };
+    }
+
+    pub fn length(self: Self) usize {
+        return self.len;
+    }
+};
+
+/// RFC9000 19.3. ACK Frames
+///
+/// ACK Frame {
+///   Type (i) = 0x02..0x03,
+///   Largest Acknowledged (i),
+///   ACK Delay (i),
+///   ACK Range Count (i),
+///   First ACK Range (i),
+///   ACK Range (..) ...,
+///   [ECN Counts (..)],
+/// }
+/// Figure 25: ACK Frame Format
+pub const AckFrame = struct {
+    const Self = @This();
+
+    /// RFC9000 19.3.1. ACK Ranges
+    /// ACK Range {
+    ///   Gap (i),
+    ///   ACK Range Length (i),
+    /// }
+    /// Figure 26: ACK Ranges
+    pub const AckRange = struct {
+        const Self = @This();
+
+        gap: VLI,
+        ack_range_length: VLI,
+
+        pub fn decodeFromSlice(buf: []const u8) AckRange {
+            var offset: usize = 0;
+            const gap = VLI.decodeFromSlice(buf);
+            offset += gap.length;
+            const ack_range_length = VLI.decodeFromSlice(buf[offset..]);
+
+            return AckRange{ .gap = gap, .ack_range_length = ack_range_length };
+        }
+
+        pub fn length(self: AckRange) usize {
+            return @as(usize, self.gap.length) + @as(usize, self.gap.length);
+        }
+    };
+
+    /// RFC9000 19.3.2. ECN Counts
+    /// ECN Counts {
+    ///   ECT0 Count (i),
+    ///   ECT1 Count (i),
+    ///   ECN-CE Count (i),
+    /// }
+    /// Figure 27: ECN Count Format
+    pub const ECNCounts = struct {
+        ECT0_count: VLI,
+        ECT1_count: VLI,
+        ECN_CE_count: VLI,
+
+        pub fn decodeFromSlice(buf: []const u8) ECNCounts {
+            var offset: usize = 0;
+            const ECT0 = VLI.decodeFromSlice(buf);
+            offset += ECT0.length;
+            const ECT1 = VLI.decodeFromSlice(buf[offset..]);
+            offset += ECT1.length;
+            const ECNCE = VLI.decodeFromSlice(buf[offset..]);
+
+            return ECNCounts{
+                .ECT0_count = ECT0,
+                .ECT1_count = ECT1,
+                .ECN_CE_count = ECNCE,
+            };
+        }
+
+        pub fn length(self: ECNCounts) usize {
+            return @as(usize, self.ECT0_count.length) + @as(usize, self.ECT1_count.length) + @as(usize, self.ECN_CE_count.length);
+        }
+    };
+
+    frame_type: FrameType,
+    largest_acked: VLI,
+    ack_delay: VLI,
+    ack_range_count: VLI,
+    first_ack_range: VLI,
+
+    frame_length: usize,
+
+    pub fn decodeFromSlice(buf: []const u8) Self {
+        var frame_length: usize = 0;
+
+        const ft_vli = VLI.decodeFromSlice(buf);
+        frame_length += ft_vli.length;
+        const ft: FrameType = @enumFromInt(ft_vli.value);
+
+        const largest_acked = VLI.decodeFromSlice(buf[frame_length..]);
+        frame_length += largest_acked.length;
+
+        const ack_delay = VLI.decodeFromSlice(buf[frame_length..]);
+        frame_length += ack_delay.length;
+
+        const ack_range_count = VLI.decodeFromSlice(buf[frame_length..]);
+        frame_length += ack_range_count.length;
+
+        const first_ack_range = VLI.decodeFromSlice(buf[frame_length..]);
+        frame_length += first_ack_range.length;
+
+        var i: usize = 0;
+        while (i < ack_range_count.value) : (i += 1) {
+            const ar = AckRange.decodeFromSlice(buf[frame_length..]);
+            frame_length += ar.length();
+        }
+
+        if (ft == .ackECN) {
+            const ECN_cnt = ECNCounts.decodeFromSlice(buf[frame_length..]);
+            frame_length += ECN_cnt.length();
+        }
+
+        return Self{
+            .frame_type = ft,
+            .largest_acked = largest_acked,
+            .ack_delay = ack_delay,
+            .ack_range_count = ack_range_count,
+            .first_ack_range = first_ack_range,
+            .frame_length = frame_length,
+        };
+    }
+
+    pub fn length(self: Self) usize {
+        return self.frame_length;
+    }
+};
+
+/// RFC9000 19.6. CRYPTO Frames
+///
+/// CRYPTO Frame {
+///   Type (i) = 0x06,
+///   Offset (i),
+///   Length (i),
+///   Crypto Data (..),
+/// }
+/// Figure 30: CRYPTO Frame Format
+pub const CryptoFrame = struct {
+    const Self = @This();
+
+    offset: VLI,
+    len: VLI,
+    frame_length: usize,
+
+    data: []const u8,
+    pub fn decodeFromSlice(buf: []const u8) Self {
+        var frame_length: usize = 0;
+
+        const frame_type = VLI.decodeFromSlice(buf);
+        frame_length += frame_type.length;
+
+        const offset_vli = VLI.decodeFromSlice(buf[frame_length..]);
+        frame_length += offset_vli.length;
+
+        const length_vli = VLI.decodeFromSlice(buf[frame_length..]);
+        frame_length += length_vli.length;
+
+        const data_offset = frame_length;
+
+        frame_length += length_vli.value;
+
+        return Self{
+            .offset = offset_vli,
+            .len = length_vli,
+            .frame_length = frame_length,
+            .data = buf[data_offset..frame_length],
+        };
+    }
+
+    pub fn length(self: Self) usize {
+        return self.frame_length;
+    }
+};
+
 const Aes128 = std.crypto.core.aes.Aes128;
 fn getHeaderProtectonMask(sample: *const [Aes128.block.block_length]u8, hp: [Aes128.key_bits / 8]u8) [5]u8 {
     const enc = Aes128.initEnc(hp);
@@ -429,8 +721,37 @@ test "parse Client Initial Packet" {
     var m = [_]u8{0} ** 1500;
     const payload = client_msgs[pkt.protected_offset + pn_len ..];
     try Aes128Gcm.decrypt(m[0 .. payload.len - Aes128Gcm.tag_length], payload[0 .. payload.len - Aes128Gcm.tag_length], payload[payload.len - Aes128Gcm.tag_length ..][0..Aes128Gcm.tag_length].*, client_msgs[0 .. pkt.protected_offset + pn_len], nonce, secret.client_secret.key);
+    const plain = m[0 .. payload.len - Aes128Gcm.tag_length];
 
-    //_ = try PayloadDecryptor(key.InitialSecret.Aead).decrypt(&m, pkt.payload, pkt.header, pkt.secret.client_secret, pkt.pkt_number);
+    const frame = Frame.decodeFromSlice(plain);
+    try expect(frame == Frame.crypto);
+    const crypto_frame = frame.crypto;
+    try expect(crypto_frame.offset.value == 0);
+    try expect(crypto_frame.len.value == 0xf1);
+
+    var readStream = std.io.fixedBufferStream(crypto_frame.data);
+    var hs = try tls13.handshake.Handshake.decode(readStream.reader(), std.testing.allocator, null);
+    defer hs.deinit();
+    try expect(hs == tls13.handshake.Handshake.client_hello);
+    const ch = hs.client_hello;
+    const exts = ch.extensions.items;
+    try expect(exts.len == 11);
+    const quic_trans_params = exts[10].quic_transport_parameters;
+    try expect(quic_trans_params.length() == 0x32);
+    try expect(quic_trans_params.params.items.len == 8);
+    const qtps = quic_trans_params.params.items;
+    try expect(qtps[0].id == tls13.quic.TransportParameterType.initial_max_data);
+    try expect(qtps[1].id == tls13.quic.TransportParameterType.initial_max_stream_data_bidi_local);
+    try expect(qtps[2].id == tls13.quic.TransportParameterType.initial_max_stream_data_uni);
+    try expect(qtps[3].id == tls13.quic.TransportParameterType.initial_max_streams_bidi);
+    try expect(qtps[4].id == tls13.quic.TransportParameterType.max_idle_timeout);
+    try expect(qtps[5].id == tls13.quic.TransportParameterType.initial_max_streams_uni);
+    try expect(qtps[6].id == tls13.quic.TransportParameterType.initial_source_connection_id);
+    try expect(qtps[7].id == tls13.quic.TransportParameterType.initial_max_stream_data_bidi_remote);
+
+    const frame2 = Frame.decodeFromSlice(plain[frame.length()..]);
+    try expect(frame2 == Frame.padding);
+    try expect(frame2.padding.len == 917);
 }
 
 test "parse Server Initial Packet" {
@@ -465,4 +786,30 @@ test "parse Server Initial Packet" {
     var m = [_]u8{0} ** 1500;
     const payload = recv_msg[pkt.protected_offset + pn_len ..];
     try Aes128Gcm.decrypt(m[0 .. payload.len - Aes128Gcm.tag_length], payload[0 .. payload.len - Aes128Gcm.tag_length], payload[payload.len - Aes128Gcm.tag_length ..][0..Aes128Gcm.tag_length].*, recv_msg[0 .. pkt.protected_offset + pn_len], nonce, secret.server_secret.key);
+
+    const plain = m[0 .. payload.len - Aes128Gcm.tag_length];
+    const frame = Frame.decodeFromSlice(plain);
+    try expect(frame == Frame.ack);
+    const ack = frame.ack;
+    try expect(ack.largest_acked.value == 0);
+    try expect(ack.ack_delay.value == 0);
+    try expect(ack.ack_range_count.value == 0);
+    try expect(ack.first_ack_range.value == 0);
+
+    const frame2 = Frame.decodeFromSlice(plain[frame.length()..]);
+    try expect(frame2 == Frame.crypto);
+    const crypto_frame = frame2.crypto;
+    try expect(crypto_frame.offset.value == 0);
+    try expect(crypto_frame.len.value == 0x5a);
+    var readStream = std.io.fixedBufferStream(crypto_frame.data);
+    var hs = try tls13.handshake.Handshake.decode(readStream.reader(), std.testing.allocator, null);
+    defer hs.deinit();
+    try expect(hs == tls13.handshake.Handshake.server_hello);
+    const sh = hs.server_hello;
+    const exts = sh.extensions.items;
+    try expect(exts.len == 2);
+    try expect(exts[0] == .key_share);
+    const ks = exts[0].key_share;
+    try expect(ks.entries.items[0].group == .x25519);
+    try expect(exts[1] == .supported_versions);
 }

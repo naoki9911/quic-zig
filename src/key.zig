@@ -1,5 +1,5 @@
 const std = @import("std");
-const tls13crypto = @import("tls13-crypto");
+const tls13crypto = @import("tls13").crypto;
 
 pub fn AeadSecret(comptime Aead: type) type {
     return struct {
