@@ -15,6 +15,13 @@ pub const VLI = struct {
 
     const Self = @This();
 
+    pub fn default() Self {
+        return .{
+            .value = 0,
+            .length = 0,
+        };
+    }
+
     pub fn decodeFromSlice(buf: []const u8) Self {
         const type_bits: u2 = @intCast((buf[0] >> 6) & 0x3);
         switch (type_bits) {
@@ -51,6 +58,32 @@ pub const VLI = struct {
                     .length = 8,
                 };
             },
+        }
+    }
+
+    pub fn encodeToSlice(self: Self, buf: []u8) usize {
+        switch (self.length) {
+            1 => {
+                const type_byte: u8 = @intCast(self.value & 0x3F);
+                buf[0] = type_byte;
+                return 1;
+            },
+            2 => {
+                std.mem.writeInt(u16, buf[0..2], @intCast(self.value), .big);
+                buf[0] = (buf[0] & 0x3F) | (1 << 6);
+                return 2;
+            },
+            4 => {
+                std.mem.writeInt(u32, buf[0..4], @intCast(self.value), .big);
+                buf[0] = (buf[0] & 0x3F) | (2 << 6);
+                return 4;
+            },
+            8 => {
+                std.mem.writeInt(u64, buf[0..8], @intCast(self.value), .big);
+                buf[0] = (buf[0] & 0x3F) | (3 << 6);
+                return 8;
+            },
+            else => @panic("invalid length"),
         }
     }
 };
@@ -111,7 +144,7 @@ pub const LongHeaderPacket = struct {
         var idx: usize = 0;
 
         // validate Header From
-        if ((buf[idx] >> 7) & 0x1 == 0) {
+        if ((buf[idx] >> 7) & 0x1 != 1) {
             return QuicPacketError.InvalidHeaderForm;
         }
 
@@ -154,6 +187,29 @@ pub const LongHeaderPacket = struct {
             .source_connection_id = src_con_id,
         };
     }
+
+    pub fn encodeToSlice(self: Self, buf: []u8, tsb: u4) usize {
+        var idx: usize = 0;
+        buf[0] = 0x3 << 6;
+        buf[0] = buf[0] | (@as(u8, @intFromEnum(self.packet_type)) << 4);
+        buf[0] = buf[0] | tsb;
+        idx += 1;
+
+        std.mem.writeInt(u32, buf[idx .. idx + 4][0..4], self.version, .big);
+        idx += 4;
+
+        buf[idx] = @intCast(self.destination_connection_id.len);
+        idx += 1;
+        std.mem.copyForwards(u8, buf[idx..], self.destination_connection_id);
+        idx += self.destination_connection_id.len;
+
+        buf[idx] = @intCast(self.source_connection_id.len);
+        idx += 1;
+        std.mem.copyForwards(u8, buf[idx..], self.source_connection_id);
+        idx += self.source_connection_id.len;
+
+        return idx;
+    }
 };
 
 /// RFC9000 Section 17.2. Long Header Packets Figure 15
@@ -180,6 +236,7 @@ pub const InitialPacket = struct {
 
     lhp: LongHeaderPacket,
 
+    token_length: VLI,
     // not owning
     token: []const u8,
 
@@ -218,10 +275,21 @@ pub const InitialPacket = struct {
         return Self{
             .lhp = lhp,
             .token = token,
+            .token_length = token_length_vli,
             .length = length_vli,
             .sample = sample,
             .protected_offset = lhp.length + payload_idx,
         };
+    }
+
+    pub fn encodeToSlice(self: Self, buf: []u8, pn_len: u4) usize {
+        var idx = self.lhp.encodeToSlice(buf, pn_len - 1);
+        idx += self.token_length.encodeToSlice(buf[idx..]);
+        std.mem.copyForwards(u8, buf[idx..], self.token);
+        idx += self.token.len;
+        idx += self.length.encodeToSlice(buf[idx..]);
+
+        return idx;
     }
 };
 
@@ -310,6 +378,12 @@ pub const Frame = union(FrameType) {
         }
     }
 
+    pub fn encodeToSlice(self: Self, buf: []u8) usize {
+        switch (self) {
+            inline else => |case| return case.encodeToSlice(buf),
+        }
+    }
+
     pub fn length(self: Self) usize {
         switch (self) {
             inline else => |case| return case.length(),
@@ -337,6 +411,14 @@ pub const PaddingFrame = struct {
         }
 
         return Self{ .len = len };
+    }
+
+    pub fn encodeToSlice(self: Self, buf: []u8) usize {
+        var i: usize = 0;
+        while (i < self.len) : (i += 1) {
+            buf[i] = 0;
+        }
+        return self.len;
     }
 
     pub fn length(self: Self) usize {
@@ -397,6 +479,14 @@ pub const AckFrame = struct {
         ECT1_count: VLI,
         ECN_CE_count: VLI,
 
+        pub fn default() ECNCounts {
+            return .{
+                .ECT0_count = VLI.default(),
+                .ECT1_count = VLI.default(),
+                .ECN_CE_count = VLI.default(),
+            };
+        }
+
         pub fn decodeFromSlice(buf: []const u8) ECNCounts {
             var offset: usize = 0;
             const ECT0 = VLI.decodeFromSlice(buf);
@@ -412,16 +502,27 @@ pub const AckFrame = struct {
             };
         }
 
+        pub fn encodeToSlice(self: ECNCounts, buf: []u8) usize {
+            var idx = self.ECT0_count.encodeToSlice(buf);
+            idx += self.ECT1_count.encodeToSlice(buf[idx..]);
+            idx += self.ECN_CE_count.encodeToSlice(buf[idx..]);
+
+            return idx;
+        }
+
         pub fn length(self: ECNCounts) usize {
             return @as(usize, self.ECT0_count.length) + @as(usize, self.ECT1_count.length) + @as(usize, self.ECN_CE_count.length);
         }
     };
 
     frame_type: FrameType,
+    frame_type_vli: VLI,
     largest_acked: VLI,
     ack_delay: VLI,
     ack_range_count: VLI,
     first_ack_range: VLI,
+    ack_range_data: []const u8, // not owning
+    ECN_counts: ECNCounts,
 
     frame_length: usize,
 
@@ -444,25 +545,48 @@ pub const AckFrame = struct {
         const first_ack_range = VLI.decodeFromSlice(buf[frame_length..]);
         frame_length += first_ack_range.length;
 
+        const ar_start_idx = frame_length;
         var i: usize = 0;
         while (i < ack_range_count.value) : (i += 1) {
             const ar = AckRange.decodeFromSlice(buf[frame_length..]);
             frame_length += ar.length();
         }
+        const ar_end_idx = frame_length;
 
+        var ECN_cnt = ECNCounts.default();
         if (ft == .ackECN) {
-            const ECN_cnt = ECNCounts.decodeFromSlice(buf[frame_length..]);
+            ECN_cnt = ECNCounts.decodeFromSlice(buf[frame_length..]);
             frame_length += ECN_cnt.length();
         }
 
         return Self{
             .frame_type = ft,
+            .frame_type_vli = ft_vli,
             .largest_acked = largest_acked,
             .ack_delay = ack_delay,
             .ack_range_count = ack_range_count,
             .first_ack_range = first_ack_range,
+            .ack_range_data = buf[ar_start_idx..ar_end_idx],
+            .ECN_counts = ECN_cnt,
             .frame_length = frame_length,
         };
+    }
+
+    pub fn encodeToSlice(self: Self, buf: []u8) usize {
+        var idx: usize = 0;
+        idx += self.frame_type_vli.encodeToSlice(buf);
+        idx += self.largest_acked.encodeToSlice(buf[idx..]);
+        idx += self.ack_delay.encodeToSlice(buf[idx..]);
+        idx += self.ack_range_count.encodeToSlice(buf[idx..]);
+        idx += self.first_ack_range.encodeToSlice(buf[idx..]);
+        std.mem.copyForwards(u8, buf[idx..], self.ack_range_data);
+        idx += self.ack_range_data.len;
+
+        if (self.frame_type == .ackECN) {
+            idx += self.ECN_counts.encodeToSlice(buf[idx..]);
+        }
+
+        return idx;
     }
 
     pub fn length(self: Self) usize {
@@ -482,6 +606,7 @@ pub const AckFrame = struct {
 pub const CryptoFrame = struct {
     const Self = @This();
 
+    frame_type: VLI,
     offset: VLI,
     len: VLI,
     frame_length: usize,
@@ -504,11 +629,21 @@ pub const CryptoFrame = struct {
         frame_length += length_vli.value;
 
         return Self{
+            .frame_type = frame_type,
             .offset = offset_vli,
             .len = length_vli,
             .frame_length = frame_length,
             .data = buf[data_offset..frame_length],
         };
+    }
+
+    pub fn encodeToSlice(self: Self, buf: []u8) usize {
+        var frame_length: usize = 0;
+        frame_length += self.frame_type.encodeToSlice(buf);
+        frame_length += self.offset.encodeToSlice(buf[frame_length..]);
+        frame_length += self.len.encodeToSlice(buf[frame_length..]);
+        std.mem.copyForwards(u8, buf[frame_length .. frame_length + self.data.len], self.data);
+        return frame_length + self.data.len;
     }
 
     pub fn length(self: Self) usize {
@@ -546,6 +681,25 @@ fn unlockHeaderProtection(
     }
 }
 
+fn lockHeaderProtection(
+    buf: []u8,
+    protected_offset: usize,
+    pn_len: usize,
+    sample: *const [Aes128.block.block_length]u8,
+    hp: [Aes128.key_bits / 8]u8,
+) void {
+    const mask = getHeaderProtectonMask(sample, hp);
+    if (buf[0] & 0x80 == 0x80) {
+        buf[0] ^= mask[0] & 0xf;
+    } else {
+        buf[0] ^= mask[0] & 0x1f;
+    }
+
+    for (0..pn_len, mask[1 .. 1 + pn_len]) |i, m| {
+        buf[protected_offset + i] ^= m;
+    }
+}
+
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 fn getNonce(pkt_number: u32, iv: [Aes128Gcm.nonce_length]u8) [Aes128Gcm.nonce_length]u8 {
     var nonce = [_]u8{0} ** Aes128Gcm.nonce_length;
@@ -558,11 +712,12 @@ fn getNonce(pkt_number: u32, iv: [Aes128Gcm.nonce_length]u8) [Aes128Gcm.nonce_le
 }
 
 const expect = std.testing.expect;
+const aead = @import("aead.zig");
 
 test "parse Client Initial Packet" {
     // RFC9001 A.2. Client Initial
     // zig fmt: off
-    var client_msgs = [_]u8{
+    const recv_msg = [_]u8{
     0xC0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x83, 0x94, 0xC8, 0xF0, 
     0x3E, 0x51, 0x57, 0x08, 0x00, 0x00, 0x44, 0x9E, 0x7B, 0x9A, 
     0xEC, 0x34, 0xD1, 0xB1, 0xC9, 0x8D, 0xD7, 0x68, 0x9F, 0xB8, 
@@ -686,7 +841,11 @@ test "parse Client Initial Packet" {
     };
     // zig fmt: on
 
-    const pkt = try InitialPacket.decodeFromSlice(&client_msgs, false);
+    var client_msg_buf = [_]u8{0} ** 1500;
+    std.mem.copyForwards(u8, &client_msg_buf, &recv_msg);
+    const client_msgs = client_msg_buf[0..recv_msg.len];
+
+    const pkt = try InitialPacket.decodeFromSlice(client_msgs, false);
 
     try expect(pkt.lhp.version == 1);
     try expect(pkt.lhp.type_specific_bits == 0);
@@ -713,15 +872,14 @@ test "parse Client Initial Packet" {
 
     var pn_len: usize = 0;
     var pn: u32 = 0;
-    unlockHeaderProtection(&client_msgs, pkt.protected_offset, &pn_len, &pn, pkt.sample, secret.client_secret.hp);
+    unlockHeaderProtection(client_msgs, pkt.protected_offset, &pn_len, &pn, pkt.sample, secret.client_secret.hp);
     try expect(pn_len == 4);
     try expect(pn == 2);
 
     const nonce = getNonce(pn, secret.client_secret.iv);
     var m = [_]u8{0} ** 1500;
     const payload = client_msgs[pkt.protected_offset + pn_len ..];
-    try Aes128Gcm.decrypt(m[0 .. payload.len - Aes128Gcm.tag_length], payload[0 .. payload.len - Aes128Gcm.tag_length], payload[payload.len - Aes128Gcm.tag_length ..][0..Aes128Gcm.tag_length].*, client_msgs[0 .. pkt.protected_offset + pn_len], nonce, secret.client_secret.key);
-    const plain = m[0 .. payload.len - Aes128Gcm.tag_length];
+    const plain = try aead.EasyAes128Gcm.decrypt(&m, payload, client_msgs[0 .. pkt.protected_offset + pn_len], nonce, secret.client_secret.key);
 
     const frame = Frame.decodeFromSlice(plain);
     try expect(frame == Frame.crypto);
@@ -752,11 +910,37 @@ test "parse Client Initial Packet" {
     const frame2 = Frame.decodeFromSlice(plain[frame.length()..]);
     try expect(frame2 == Frame.padding);
     try expect(frame2.padding.len == 917);
+
+    var buf = [_]u8{0} ** 1500;
+    var writeStream = std.io.fixedBufferStream(&buf);
+
+    const enc_len = try hs.encode(writeStream.writer());
+    try expect(enc_len == crypto_frame.data.len);
+    try expect(std.mem.eql(u8, crypto_frame.data, buf[0..enc_len]));
+
+    var send_buf = [_]u8{0} ** 1500;
+    const hdr_size = pkt.encodeToSlice(&send_buf, 4);
+    std.mem.writeInt(u32, send_buf[hdr_size..][0..4], 2, .big);
+    try expect(std.mem.eql(u8, send_buf[0 .. hdr_size + 4], client_msgs[0 .. hdr_size + 4]));
+
+    var idx = hdr_size + 4;
+    idx += frame.encodeToSlice(send_buf[idx..]);
+    idx += frame2.encodeToSlice(send_buf[idx..]);
+    try expect(std.mem.eql(u8, send_buf[hdr_size + 4 .. idx], plain));
+
+    const enc_res = aead.EasyAes128Gcm.encrypt(send_buf[hdr_size + 4 ..], send_buf[hdr_size + 4 .. idx], send_buf[0 .. hdr_size + 4], nonce, secret.client_secret.key);
+    idx += Aes128Gcm.tag_length;
+    try expect(std.mem.eql(u8, enc_res, payload));
+
+    lockHeaderProtection(&send_buf, pkt.protected_offset, 4, send_buf[pkt.protected_offset + 4 .. pkt.protected_offset + 20][0..16], secret.client_secret.hp);
+    try expect(std.mem.eql(u8, send_buf[0..idx], &recv_msg));
+    ////std.debug.print("actual={}\n", .{std.fmt.fmtSliceHexLower(send_buf[0..idx])});
+    ////std.debug.print("expected={}\n", .{std.fmt.fmtSliceHexLower(&recv_msg)});
 }
 
 test "parse Server Initial Packet" {
     // RFC9001 A.3. Server Initial
-    var recv_msg = [_]u8{
+    const recv_msg = [_]u8{
         0xCF, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0xF0, 0x67, 0xA5,
         0x50, 0x2A, 0x42, 0x62, 0xB5, 0x00, 0x40, 0x75, 0xC0, 0xD9,
         0x5A, 0x48, 0x2C, 0xD0, 0x99, 0x1C, 0xD2, 0x5B, 0x0A, 0xAC,
@@ -773,19 +957,23 @@ test "parse Server Initial Packet" {
         0x40, 0x7D, 0xD0, 0x74, 0xEE,
     };
 
+    var server_msg_buf = [_]u8{0} ** 1500;
+    std.mem.copyForwards(u8, &server_msg_buf, &recv_msg);
+    const server_msg = server_msg_buf[0..recv_msg.len];
+
     const dst_con_id = [_]u8{ 0x83, 0x94, 0xC8, 0xF0, 0x3E, 0x51, 0x57, 0x08 };
-    const pkt = try InitialPacket.decodeFromSlice(&recv_msg, true);
+    const pkt = try InitialPacket.decodeFromSlice(server_msg, true);
     const secret = try key.InitialSecret.generate(&dst_con_id);
     var pn_len: usize = 0;
     var pn: u32 = 0;
-    unlockHeaderProtection(&recv_msg, pkt.protected_offset, &pn_len, &pn, pkt.sample, secret.server_secret.hp);
+    unlockHeaderProtection(server_msg, pkt.protected_offset, &pn_len, &pn, pkt.sample, secret.server_secret.hp);
     try expect(pn_len == 2);
     try expect(pn == 1);
 
     const nonce = getNonce(pn, secret.server_secret.iv);
     var m = [_]u8{0} ** 1500;
-    const payload = recv_msg[pkt.protected_offset + pn_len ..];
-    try Aes128Gcm.decrypt(m[0 .. payload.len - Aes128Gcm.tag_length], payload[0 .. payload.len - Aes128Gcm.tag_length], payload[payload.len - Aes128Gcm.tag_length ..][0..Aes128Gcm.tag_length].*, recv_msg[0 .. pkt.protected_offset + pn_len], nonce, secret.server_secret.key);
+    const payload = server_msg[pkt.protected_offset + pn_len ..];
+    try Aes128Gcm.decrypt(m[0 .. payload.len - Aes128Gcm.tag_length], payload[0 .. payload.len - Aes128Gcm.tag_length], payload[payload.len - Aes128Gcm.tag_length ..][0..Aes128Gcm.tag_length].*, server_msg[0 .. pkt.protected_offset + pn_len], nonce, secret.server_secret.key);
 
     const plain = m[0 .. payload.len - Aes128Gcm.tag_length];
     const frame = Frame.decodeFromSlice(plain);
@@ -812,4 +1000,28 @@ test "parse Server Initial Packet" {
     const ks = exts[0].key_share;
     try expect(ks.entries.items[0].group == .x25519);
     try expect(exts[1] == .supported_versions);
+
+    var buf = [_]u8{0} ** 1500;
+    var writeStream = std.io.fixedBufferStream(&buf);
+
+    const enc_len = try hs.encode(writeStream.writer());
+    try expect(enc_len == crypto_frame.data.len);
+    try expect(std.mem.eql(u8, crypto_frame.data, buf[0..enc_len]));
+
+    var send_buf = [_]u8{0} ** 1500;
+    const hdr_size = pkt.encodeToSlice(&send_buf, 2);
+    std.mem.writeInt(u16, send_buf[hdr_size..][0..2], 1, .big);
+    try expect(std.mem.eql(u8, send_buf[0 .. hdr_size + 2], server_msg[0 .. hdr_size + 2]));
+
+    var idx = hdr_size + 2;
+    idx += frame.encodeToSlice(send_buf[idx..]);
+    idx += frame2.encodeToSlice(send_buf[idx..]);
+    try expect(std.mem.eql(u8, send_buf[hdr_size + 2 .. idx], plain));
+
+    const enc_res = aead.EasyAes128Gcm.encrypt(send_buf[hdr_size + 2 ..], send_buf[hdr_size + 2 .. idx], send_buf[0 .. hdr_size + 2], nonce, secret.server_secret.key);
+    idx += Aes128Gcm.tag_length;
+    try expect(std.mem.eql(u8, enc_res, payload));
+
+    lockHeaderProtection(&send_buf, pkt.protected_offset, 2, send_buf[pkt.protected_offset + 4 .. pkt.protected_offset + 20][0..16], secret.server_secret.hp);
+    try expect(std.mem.eql(u8, send_buf[0..idx], &recv_msg));
 }
