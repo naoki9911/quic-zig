@@ -129,7 +129,6 @@ pub const LongHeaderType = enum(u4) {
 pub const LongHeaderPacket = struct {
     const Self = @This();
 
-    length: usize,
     packet_type: LongHeaderType,
     type_specific_bits: u4,
     version: u32,
@@ -179,7 +178,6 @@ pub const LongHeaderPacket = struct {
         idx += src_con_id_len;
 
         return Self{
-            .length = idx,
             .packet_type = pkt_type,
             .type_specific_bits = specific_bits,
             .version = version,
@@ -209,6 +207,14 @@ pub const LongHeaderPacket = struct {
         idx += self.source_connection_id.len;
 
         return idx;
+    }
+
+    pub fn length(self: Self) usize {
+        var len: usize = 1;
+        len += 4;
+        len += 1 + self.destination_connection_id.len;
+        len += 1 + self.source_connection_id.len;
+        return len;
     }
 };
 
@@ -254,7 +260,7 @@ pub const InitialPacket = struct {
             return QuicPacketError.NotInitialPacket;
         }
 
-        const payload_slice = buf[lhp.length..];
+        const payload_slice = buf[lhp.length()..];
 
         var payload_idx: usize = 0;
         const token_length_vli = VLI.decodeFromSlice(payload_slice);
@@ -278,7 +284,7 @@ pub const InitialPacket = struct {
             .token_length = token_length_vli,
             .length = length_vli,
             .sample = sample,
-            .protected_offset = lhp.length + payload_idx,
+            .protected_offset = lhp.length() + payload_idx,
         };
     }
 
@@ -290,6 +296,16 @@ pub const InitialPacket = struct {
         idx += self.length.encodeToSlice(buf[idx..]);
 
         return idx;
+    }
+
+    /// return header length withtou packet number
+    pub fn header_length(self: Self) usize {
+        var len: usize = self.lhp.length();
+        len += self.token_length.length;
+        len += self.token.len;
+        len += self.length.length;
+
+        return len;
     }
 };
 
@@ -400,6 +416,12 @@ pub const PaddingFrame = struct {
     const Self = @This();
 
     len: usize,
+    pub fn init(len: usize) Self {
+        return .{
+            .len = len,
+        };
+    }
+
     pub fn decodeFromSlice(buf: []const u8) Self {
         var len: usize = 0;
         for (buf) |b| {
@@ -609,7 +631,6 @@ pub const CryptoFrame = struct {
     frame_type: VLI,
     offset: VLI,
     len: VLI,
-    frame_length: usize,
 
     data: []const u8,
     pub fn decodeFromSlice(buf: []const u8) Self {
@@ -625,29 +646,40 @@ pub const CryptoFrame = struct {
         frame_length += length_vli.length;
 
         const data_offset = frame_length;
-
         frame_length += length_vli.value;
 
         return Self{
             .frame_type = frame_type,
             .offset = offset_vli,
             .len = length_vli,
-            .frame_length = frame_length,
             .data = buf[data_offset..frame_length],
         };
     }
 
     pub fn encodeToSlice(self: Self, buf: []u8) usize {
-        var frame_length: usize = 0;
-        frame_length += self.frame_type.encodeToSlice(buf);
-        frame_length += self.offset.encodeToSlice(buf[frame_length..]);
-        frame_length += self.len.encodeToSlice(buf[frame_length..]);
+        const frame_length = self.encodeToSliceWithoutData(buf);
         std.mem.copyForwards(u8, buf[frame_length .. frame_length + self.data.len], self.data);
         return frame_length + self.data.len;
     }
 
+    pub fn encodeToSliceWithoutData(self: Self, buf: []u8) usize {
+        var frame_length: usize = 0;
+        frame_length += self.frame_type.encodeToSlice(buf);
+        frame_length += self.offset.encodeToSlice(buf[frame_length..]);
+        frame_length += self.len.encodeToSlice(buf[frame_length..]);
+        return frame_length;
+    }
+
     pub fn length(self: Self) usize {
-        return self.frame_length;
+        return self.header_length() + self.data.len;
+    }
+
+    pub fn header_length(self: Self) usize {
+        var frame_length = self.frame_type.length;
+        frame_length += self.offset.length;
+        frame_length += self.len.length;
+
+        return frame_length;
     }
 };
 
@@ -681,7 +713,7 @@ fn unlockHeaderProtection(
     }
 }
 
-fn lockHeaderProtection(
+pub fn lockHeaderProtection(
     buf: []u8,
     protected_offset: usize,
     pn_len: usize,
@@ -701,7 +733,7 @@ fn lockHeaderProtection(
 }
 
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
-fn getNonce(pkt_number: u32, iv: [Aes128Gcm.nonce_length]u8) [Aes128Gcm.nonce_length]u8 {
+pub fn getNonce(pkt_number: u32, iv: [Aes128Gcm.nonce_length]u8) [Aes128Gcm.nonce_length]u8 {
     var nonce = [_]u8{0} ** Aes128Gcm.nonce_length;
     std.mem.writeInt(u32, nonce[nonce.len - 4 ..], pkt_number, .big);
     for (&nonce, iv) |*n, i| {
@@ -851,7 +883,10 @@ test "parse Client Initial Packet" {
     try expect(pkt.lhp.type_specific_bits == 0);
     try expect(std.mem.eql(u8, pkt.lhp.source_connection_id, &[_]u8{}));
     try expect(std.mem.eql(u8, pkt.lhp.destination_connection_id, &[_]u8{ 0x83, 0x94, 0xC8, 0xF0, 0x3E, 0x51, 0x57, 0x08 }));
+    try expect(pkt.token.len == 0);
+    try expect(pkt.length.length == 2);
     try expect(pkt.length.value == 0x049E);
+    try expect(pkt.length.value + pkt.header_length() == 1200);
 
     const sample_ans = [_]u8{
         0xD1, 0xB1, 0xC9, 0x8D, 0xD7, 0x68, 0x9F, 0xB8, 0xEC, 0x11,
@@ -884,7 +919,10 @@ test "parse Client Initial Packet" {
     const frame = Frame.decodeFromSlice(plain);
     try expect(frame == Frame.crypto);
     const crypto_frame = frame.crypto;
+    try expect(crypto_frame.frame_type.length == 1);
+    try expect(crypto_frame.offset.length == 1);
     try expect(crypto_frame.offset.value == 0);
+    try expect(crypto_frame.len.length == 2);
     try expect(crypto_frame.len.value == 0xf1);
 
     var readStream = std.io.fixedBufferStream(crypto_frame.data);
@@ -892,8 +930,20 @@ test "parse Client Initial Packet" {
     defer hs.deinit();
     try expect(hs == tls13.handshake.Handshake.client_hello);
     const ch = hs.client_hello;
+
     const exts = ch.extensions.items;
     try expect(exts.len == 11);
+    try expect(exts[0] == .server_name);
+    try expect(exts[1] == .renegotiation_info);
+    try expect(exts[2] == .supported_groups);
+    try expect(exts[3] == .application_layer_protocol_negotiation);
+    try expect(exts[4] == .status_request);
+    try expect(exts[5] == .key_share);
+    try expect(exts[6] == .supported_versions);
+    try expect(exts[7] == .signature_algorithms);
+    try expect(exts[8] == .psk_key_exchange_modes);
+    try expect(exts[9] == .record_size_limit);
+    try expect(exts[10] == .quic_transport_parameters);
     const quic_trans_params = exts[10].quic_transport_parameters;
     try expect(quic_trans_params.length() == 0x32);
     try expect(quic_trans_params.params.items.len == 8);
@@ -934,8 +984,6 @@ test "parse Client Initial Packet" {
 
     lockHeaderProtection(&send_buf, pkt.protected_offset, 4, send_buf[pkt.protected_offset + 4 .. pkt.protected_offset + 20][0..16], secret.client_secret.hp);
     try expect(std.mem.eql(u8, send_buf[0..idx], &recv_msg));
-    ////std.debug.print("actual={}\n", .{std.fmt.fmtSliceHexLower(send_buf[0..idx])});
-    ////std.debug.print("expected={}\n", .{std.fmt.fmtSliceHexLower(&recv_msg)});
 }
 
 test "parse Server Initial Packet" {
