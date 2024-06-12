@@ -691,7 +691,7 @@ fn getHeaderProtectonMask(sample: *const [Aes128.block.block_length]u8, hp: [Aes
     return headerProtectionKey[0..5].*;
 }
 
-fn unlockHeaderProtection(
+pub fn unlockHeaderProtection(
     buf: []u8,
     protected_offset: usize,
     pn_len: *usize,
