@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
+	"io"
 	"log"
 	"os"
 
@@ -34,11 +36,19 @@ func main() {
 	if err != nil {
 		log.Fatal("Accept: ", err)
 	}
-	_ = conn
+	fmt.Println("Connection accepted")
 
-	return
-	//_, err = conn.AcceptStream(context.Background())
-	//if err != nil {
-	//	log.Fatal("AcceptStream: ", err)
-	//}
+	stream, err := conn.AcceptStream(context.Background())
+	if err != nil {
+		log.Fatal("AcceptStream: ", err)
+	}
+	defer stream.Close()
+	fmt.Println("Stream accepted")
+
+	buf := make([]byte, 100)
+	readSize, err := stream.Read(buf)
+	if err != nil && err != io.EOF {
+		log.Fatal(err)
+	}
+	fmt.Printf("recv=%s\n", string(buf[0:readSize]))
 }

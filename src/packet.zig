@@ -98,6 +98,36 @@ pub const QuicPacketError = error{
     NotInitialPacket,
 };
 
+pub const PacketType = enum(u16) {
+    short_1RTT = 0x000,
+    long_initial = 0x100,
+    //long_zeroRTT = 0x101,
+    long_handshake = 0x102,
+    //long_retry = 0x103,
+};
+
+pub const Packet = union(PacketType) {
+    short_1RTT: ShortHeaderPacket,
+    long_initial: InitialPacket,
+    long_handshake: HandshakePacket,
+
+    const Self = @This();
+    pub fn decodeFromSlice(buf: []const u8, sent_by_server: bool, dst_con_id_len: usize) QuicPacketError!Self {
+        const is_long = (buf[0] >> 7) & 0x1 == 1;
+        if (is_long) {
+            const pkt_type: LongHeaderType = @enumFromInt((buf[0] >> 4) & 0x3);
+            switch (pkt_type) {
+                .Initial => return .{ .long_initial = try InitialPacket.decodeFromSlice(buf, sent_by_server) },
+                .ZeroRTT => @panic("ZeroRTT is not implemented"),
+                .Handshake => return .{ .long_handshake = try HandshakePacket.decodeFromSlice(buf) },
+                .Retry => @panic("Retry is not implemented"),
+            }
+        } else {
+            return .{ .short_1RTT = try ShortHeaderPacket.decodeFromSlice(buf, dst_con_id_len) };
+        }
+    }
+};
+
 /// RFC9000 Section 17.2. Long Header Packets Table 5
 /// Type	Name	Section
 /// 0x00	Initial	Section 17.2.2
@@ -252,7 +282,7 @@ pub const InitialPacket = struct {
     protected_offset: usize,
     length: VLI,
 
-    pub fn decodeFromSlice(buf: []u8, sent_by_server: bool) !Self {
+    pub fn decodeFromSlice(buf: []const u8, sent_by_server: bool) !Self {
         // decode as LHP
         const lhp = try LongHeaderPacket.decodeFromSlice(buf);
 
@@ -309,6 +339,148 @@ pub const InitialPacket = struct {
     }
 };
 
+/// RFC9000 Section 17.2.4. Handshake Packet
+///
+/// Initial Packet {
+///   Header Form (1) = 1,
+///   Fixed Bit (1) = 1,
+///   Long Packet Type (2) = 0,
+///   Reserved Bits (2),
+///   Packet Number Length (2),
+///   Version (32),
+///   Destination Connection ID Length (8),
+///   Destination Connection ID (0..160),
+///   Source Connection ID Length (8),
+///   Source Connection ID (0..160),
+///   Length (i),
+///   Packet Number (8..32),
+///   Packet Payload (8..),
+/// }
+pub const HandshakePacket = struct {
+    const Self = @This();
+
+    lhp: LongHeaderPacket,
+
+    // not owning
+    sample: *const [16]u8,
+
+    protected_offset: usize,
+    length: VLI,
+
+    pub fn decodeFromSlice(buf: []const u8) !Self {
+        // decode as LHP
+        const lhp = try LongHeaderPacket.decodeFromSlice(buf);
+
+        if (lhp.packet_type != .Handshake) {
+            return QuicPacketError.NotInitialPacket;
+        }
+
+        const payload_slice = buf[lhp.length()..];
+
+        var payload_idx: usize = 0;
+        const length_vli = VLI.decodeFromSlice(payload_slice[payload_idx..]);
+        payload_idx += @intCast(length_vli.length);
+
+        const sample = payload_slice[payload_idx + 4 .. payload_idx + 4 + 16][0..16];
+
+        return Self{
+            .lhp = lhp,
+            .length = length_vli,
+            .sample = sample,
+            .protected_offset = lhp.length() + payload_idx,
+        };
+    }
+
+    pub fn encodeToSlice(self: Self, buf: []u8, pn_len: u4) usize {
+        var idx = self.lhp.encodeToSlice(buf, pn_len - 1);
+        idx += self.length.encodeToSlice(buf[idx..]);
+
+        return idx;
+    }
+
+    /// return header length withtou packet number
+    pub fn header_length(self: Self) usize {
+        var len: usize = self.lhp.length();
+        len += self.length.length;
+
+        return len;
+    }
+};
+
+/// RFC9000 17.3.1. 1-RTT Packet
+///
+/// 1-RTT Packet {
+///   Header Form (1) = 0,
+///   Fixed Bit (1) = 1,
+///   Spin Bit (1),
+///   Reserved Bits (2),
+///   Key Phase (1),
+///   Packet Number Length (2),
+///   Destination Connection ID (0..160),
+///   Packet Number (8..32),
+///   Packet Payload (8..),
+/// }
+pub const ShortHeaderPacket = struct {
+    const Self = @This();
+
+    spin_bit: u1,
+    key_phase: u1,
+
+    /// Not owning
+    destination_connection_id: []const u8,
+
+    // not owning
+    sample: *const [16]u8,
+
+    protected_offset: usize,
+
+    pub fn decodeFromSlice(buf: []const u8, dst_con_id_len: usize) QuicPacketError!Self {
+        var idx: usize = 0;
+
+        // validate Header From
+        if ((buf[idx] >> 7) & 0x1 != 0) {
+            return QuicPacketError.InvalidHeaderForm;
+        }
+
+        // ensure Fixed Bit is 1.
+        if ((buf[idx] >> 6) & 0x1 != 1) {
+            return QuicPacketError.InvalidFixedBit;
+        }
+
+        const spin_bit: u1 = @intCast(buf[idx] >> 5 & 0x1);
+        const key_phase: u1 = @intCast(buf[idx] >> 2 & 0x1);
+        idx += 1;
+
+        if (dst_con_id_len > 20) {
+            return QuicPacketError.InvalidDestinationConnectionIDLength;
+        }
+        const dst_con_id = buf[idx .. idx + dst_con_id_len];
+        idx += dst_con_id_len;
+
+        const sample = buf[idx + 4 .. idx + 4 + 16][0..16];
+        return Self{
+            .spin_bit = spin_bit,
+            .key_phase = key_phase,
+            .destination_connection_id = dst_con_id,
+            .sample = sample,
+            .protected_offset = 1 + dst_con_id_len,
+        };
+    }
+
+    pub fn encodeToSlice(self: Self, buf: []u8, tsb: u4) usize {
+        _ = self;
+        _ = buf;
+        _ = tsb;
+        @panic("not implemented");
+    }
+
+    pub fn length(self: Self) usize {
+        var len: usize = 1;
+        len += self.destination_connection_id.len;
+        return len;
+    }
+};
+
 /// RFC9000 12.4. Frames and Frame Types
 ///
 /// Type Value	Frame Type Name	Definition	Pkts	Spec
@@ -357,7 +529,7 @@ pub const FrameType = enum(u8) {
     //StreamDataBlocked = 0x15,
     //StreamsBlocked1 = 0x16,
     //StreamsBlocked2 = 0x17,
-    //NewConnectionID = 0x18,
+    newConnectionID = 0x18,
     //RetireConnectionID = 0x19,
     //PathChallenge = 0x1a,
     //PathResponse = 0x1b,
@@ -366,12 +538,17 @@ pub const FrameType = enum(u8) {
     //HandshakeDone = 0x1e,
 };
 
+pub const TransportErrorCode = error{
+    FrameEncodingError,
+};
+
 pub const Frame = union(FrameType) {
     const Self = @This();
     padding: PaddingFrame,
     ack: AckFrame,
     ackECN: AckFrame,
     crypto: CryptoFrame,
+    newConnectionID: NewConnectionIDFrame,
 
     pub fn decodeFromSlice(buf: []const u8) Self {
         const type_vli = VLI.decodeFromSlice(buf);
@@ -390,6 +567,9 @@ pub const Frame = union(FrameType) {
             },
             .crypto => return Self{
                 .crypto = CryptoFrame.decodeFromSlice(buf),
+            },
+            .newConnectionID => return Self{
+                .newConnectionID = NewConnectionIDFrame.decodeFromSlice(buf),
             },
         }
     }
@@ -645,7 +825,7 @@ pub const CryptoFrame = struct {
         const length_vli = VLI.decodeFromSlice(buf[frame_length..]);
         frame_length += length_vli.length;
 
-        const data_offset = frame_length;
+        const data_offset = frame_length + offset_vli.value;
         frame_length += length_vli.value;
 
         return Self{
@@ -680,6 +860,74 @@ pub const CryptoFrame = struct {
         frame_length += self.len.length;
 
         return frame_length;
+    }
+};
+
+/// RFC9000 19.15. NEW_CONNECTION_ID Frames
+/// NEW_CONNECTION_ID Frame {
+///   Type (i) = 0x18,
+///   Sequence Number (i),
+///   Retire Prior To (i),
+///   Length (8),
+///   Connection ID (8..160),
+///   Stateless Reset Token (128),
+/// }
+/// Figure 39: NEW_CONNECTION_ID Frame Format
+pub const NewConnectionIDFrame = struct {
+    const Self = @This();
+
+    frame_type: VLI,
+    seq_number: VLI,
+    retire_prior_to: VLI,
+
+    // not owing
+    con_id: []const u8,
+
+    stateless_reset_token: []const u8,
+
+    pub fn decodeFromSlice(buf: []const u8) Self {
+        var frame_length: usize = 0;
+
+        const frame_type = VLI.decodeFromSlice(buf);
+        frame_length += frame_type.length;
+
+        const seq_num = VLI.decodeFromSlice(buf[frame_length..]);
+        frame_length += seq_num.length;
+
+        const rpt = VLI.decodeFromSlice(buf[frame_length..]);
+        frame_length += rpt.length;
+
+        const con_id_len = buf[frame_length];
+        frame_length += 1;
+
+        const con_id = buf[frame_length .. frame_length + con_id_len];
+        frame_length += con_id_len;
+
+        const srt = buf[frame_length .. frame_length + 16];
+
+        return Self{
+            .frame_type = frame_type,
+            .seq_number = seq_num,
+            .retire_prior_to = rpt,
+            .con_id = con_id,
+            .stateless_reset_token = srt,
+        };
+    }
+
+    pub fn encodeToSlice(self: Self, buf: []u8) usize {
+        _ = self;
+        _ = buf;
+        @panic("unimplemented");
+    }
+
+    pub fn length(self: Self) usize {
+        var len: usize = self.frame_type.length;
+        len += self.seq_number.length;
+        len += self.retire_prior_to.length;
+        len += 1 + self.con_id.len;
+        len += self.stateless_reset_token.len;
+
+        return len;
     }
 };
 

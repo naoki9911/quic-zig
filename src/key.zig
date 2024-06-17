@@ -70,6 +70,41 @@ pub const InitialSecret = struct {
     }
 };
 
+// RFC9001
+// The current encryption level secret and the label "quic key" are input to the KDF to produce the AEAD key;
+// the label "quic iv" is used to derive the Initialization Vector (IV); see Section 5.3.
+// The header protection key uses the "quic hp" label; see Section 5.4.
+// Using these labels provides key separation between QUIC and TLS; see Section 9.6.
+pub const HandshakeSecret = struct {
+    // RFC 9001 5. Packet Protection
+    // Initial packets use AEAD_AES_128_GCM
+    const hkdf = tls13crypto.Hkdf.Sha256.hkdf;
+    pub const Aead = tls13crypto.Aead.Aes128Gcm.C;
+
+    const Self = @This();
+    const SecretType = AeadSecret(Aead);
+
+    client_secret: SecretType,
+    server_secret: SecretType,
+
+    pub fn generate(cs: []const u8, ss: []const u8) !Self {
+        var client_secret = SecretType{};
+        try Self.hkdf.hkdfExpandLabel(&client_secret.key, cs, "quic key", "", client_secret.key.len);
+        try Self.hkdf.hkdfExpandLabel(&client_secret.iv, cs, "quic iv", "", client_secret.iv.len);
+        try Self.hkdf.hkdfExpandLabel(&client_secret.hp, cs, "quic hp", "", client_secret.hp.len);
+
+        var server_secret = SecretType{};
+        try Self.hkdf.hkdfExpandLabel(&server_secret.key, ss, "quic key", "", server_secret.key.len);
+        try Self.hkdf.hkdfExpandLabel(&server_secret.iv, ss, "quic iv", "", server_secret.iv.len);
+        try Self.hkdf.hkdfExpandLabel(&server_secret.hp, ss, "quic hp", "", server_secret.hp.len);
+
+        return Self{
+            .client_secret = client_secret,
+            .server_secret = server_secret,
+        };
+    }
+};
+
 const expect = std.testing.expect;
 
 test "generate initial secret" {

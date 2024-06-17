@@ -2,3 +2,6 @@
 /key.*
 /main
 /client
+/http3_client
+/http3_server
+/*.pcapng

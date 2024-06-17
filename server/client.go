@@ -1,26 +1,21 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"flag"
+	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"os"
-	"sync"
 
 	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
 )
 
 func main() {
-	quiet := flag.Bool("q", false, "don't print the data")
 	keyLogFile := flag.String("keylog", "", "key log file")
-	insecure := flag.Bool("insecure", false, "skip certificate verification")
 	flag.Parse()
-	urls := flag.Args()
 
 	var keyLog io.Writer
 	if len(*keyLogFile) > 0 {
@@ -37,43 +32,29 @@ func main() {
 		log.Fatal(err)
 	}
 
-	roundTripper := &http3.RoundTripper{
-		TLSClientConfig: &tls.Config{
-			RootCAs:            pool,
-			InsecureSkipVerify: *insecure,
-			KeyLogWriter:       keyLog,
-		},
-		QUICConfig: &quic.Config{
-		},
-	}
-	defer roundTripper.Close()
-	hclient := &http.Client{
-		Transport: roundTripper,
+	tlsConfig := &tls.Config{
+		RootCAs:            pool,
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"test"},
+		KeyLogWriter:       keyLog,
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(len(urls))
-	for _, addr := range urls {
-		log.Printf("GET %s", addr)
-		go func(addr string) {
-			rsp, err := hclient.Get(addr)
-			if err != nil {
-				log.Fatal(err)
-			}
-			log.Printf("Got response for %s: %#v", addr, rsp)
-
-			body := &bytes.Buffer{}
-			_, err = io.Copy(body, rsp.Body)
-			if err != nil {
-				log.Fatal(err)
-			}
-			if *quiet {
-				log.Printf("Response Body: %d bytes", body.Len())
-			} else {
-				log.Printf("Response Body (%d bytes):\n%s", body.Len(), body.Bytes())
-			}
-			wg.Done()
-		}(addr)
+	con, err := quic.DialAddr(context.TODO(), "localhost:4242", tlsConfig, nil)
+	if err != nil {
+		log.Fatal(err)
 	}
-	wg.Wait()
+	fmt.Println("Success to open connection")
+
+	stream, err := con.OpenStream()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer stream.Close()
+	fmt.Println("Success to open stream")
+
+	writeSize, err := stream.Write([]byte("hello"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("Written %d bytes\n", writeSize)
 }
