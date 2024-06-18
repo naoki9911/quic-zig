@@ -17,9 +17,15 @@ pub fn main() !void {
     c.setRandom([_]u8{ 0xEB, 0xF8, 0xFA, 0x56, 0xF1, 0x29, 0x39, 0xB9, 0x58, 0x4A, 0x38, 0x96, 0x47, 0x2E, 0xC4, 0x0B, 0xB8, 0x63, 0xCF, 0xD3, 0xE8, 0x68, 0x04, 0xFE, 0x3A, 0x47, 0xF0, 0x6A, 0x2B, 0x69, 0x48, 0x4C });
     try c.dst_con_id.appendSlice(&[_]u8{ 0x83, 0x94, 0xC8, 0xF0, 0x3E, 0x51, 0x57, 0x08 });
     try c.src_con_id.appendSlice(&[_]u8{ 0x83, 0x94, 0xC8, 0xF0, 0x3E, 0x51, 0x57, 0x08 });
-    const pkt = try c.createInitialPacket();
-    const send_bytes = try posix.send(sockfd, pkt, 0);
-    std.debug.print("sent {} bytes\n", .{send_bytes});
+    std.debug.print("{}\n", .{c.state});
+    try c.procNext(); // send initial packet
+    std.debug.print("{}\n", .{c.state});
+    try c.procNext(); // recv initial packet
+    std.debug.print("{}\n", .{c.state});
+    try c.procNext(); // recv handshake packet
+    std.debug.print("{}\n", .{c.state});
+    try c.procNext(); // send ack packet
+    std.debug.print("{}\n", .{c.state});
 }
 
 test {

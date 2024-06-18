@@ -791,6 +791,7 @@ pub const AckFrame = struct {
         return idx;
     }
 
+    /// This function can be called only after decodeFromSlice
     pub fn length(self: Self) usize {
         return self.frame_length;
     }
