@@ -141,6 +141,7 @@ pub fn ClientImpl(comptime PacketReaderWriter: anytype) type {
         hs_msg_buf: []u8 = &[_]u8{},
         hs_msg_buf_stream: std.io.FixedBufferStream([]u8) = undefined,
 
+        init_secret: key.InitialSecret = undefined,
         s_ap_secret: key.HandshakeSecret = undefined,
         c_ap_secret: key.HandshakeSecret = undefined,
 
@@ -234,8 +235,9 @@ pub fn ClientImpl(comptime PacketReaderWriter: anytype) type {
                 },
                 .FINISH_HANDSHAKE => {
                     // send ACK as InitialPacket
-                    const ack_buf = try self.createInitialPacketAck(self.largest_recv_pn);
-                    _ = try self.pktRW.write(ack_buf);
+                    _ = try self.createInitialPacketAck(self.largest_recv_pn);
+                    _ = try self.createHandshakePacketFinished();
+                    _ = try self.pktRW.write(self.send_buf[self.send_buf_start_idx..self.send_buf_end_idx]);
 
                     // send Finished as HandshakePacket
                     self.state = .HANDSHAKE_DONE;
@@ -351,12 +353,73 @@ pub fn ClientImpl(comptime PacketReaderWriter: anytype) type {
 
             _ = pkt.encodeToSlice(self.send_buf[buf_start_idx..], 4);
 
-            const secret = try key.InitialSecret.generate(pkt.lhp.destination_connection_id);
-            const nonce = packet.getNonce(@intCast(self.sent_pn + 1), secret.client_secret.iv);
-            _ = aead.EasyAes128Gcm.encrypt(self.send_buf[enc_idx..], self.send_buf[enc_idx..buf_end_idx], self.send_buf[buf_start_idx..enc_idx], nonce, secret.client_secret.key);
+            const nonce = packet.getNonce(@intCast(self.sent_pn + 1), self.init_secret.client_secret.iv);
+            _ = aead.EasyAes128Gcm.encrypt(self.send_buf[enc_idx..], self.send_buf[enc_idx..buf_end_idx], self.send_buf[buf_start_idx..enc_idx], nonce, self.init_secret.client_secret.key);
             buf_end_idx += Aes128Gcm.tag_length;
 
-            packet.lockHeaderProtection(self.send_buf[buf_start_idx..], pkt.header_length(), 4, pkt.sample, secret.client_secret.hp);
+            packet.lockHeaderProtection(self.send_buf[buf_start_idx..], pkt.header_length(), 4, pkt.sample, self.init_secret.client_secret.hp);
+
+            self.send_buf_end_idx = buf_end_idx;
+
+            return self.send_buf[buf_start_idx..buf_end_idx];
+        }
+
+        fn createHandshakePacketFinished(self: *Self) ![]u8 {
+            // packet is concatnated at the send_buf tail.
+            const buf_start_idx = self.send_buf_end_idx;
+            var buf_end_idx = self.send_buf_end_idx;
+
+            var pkt = packet.HandshakePacket{
+                .lhp = .{
+                    .packet_type = .Handshake,
+                    .type_specific_bits = 0,
+                    .version = 1,
+                    .destination_connection_id = self.dst_con_id.slice(),
+                    .source_connection_id = self.src_con_id.slice(),
+                },
+                .sample = undefined, // must be updated
+                .protected_offset = undefined, // must be updated
+                .length = .{ .length = 2, .value = 0 }, // must be updated
+            };
+
+            buf_end_idx += pkt.header_length();
+            pkt.protected_offset = buf_end_idx - buf_start_idx; // protected fields start after header
+            std.mem.writeInt(u32, self.send_buf[buf_end_idx..][0..4], @intCast(self.sent_pn + 1), .big);
+            buf_end_idx += 4;
+            // sample field starts after PN
+            pkt.sample = self.send_buf[buf_end_idx..][0..16];
+
+            const enc_idx = buf_end_idx;
+            const cf_start_idx = buf_end_idx;
+            var cf = packet.CryptoFrame{
+                .frame_type = packet.VLI{ .length = 1, .value = @intFromEnum(packet.FrameType.crypto) },
+                .offset = packet.VLI{ .length = 1, .value = 0 },
+                .len = packet.VLI{ .length = 2, .value = 0 }, // must be updated
+                .data = &[_]u8{},
+            };
+            buf_end_idx += cf.header_length();
+
+            var writeStream = std.io.fixedBufferStream(self.send_buf[buf_end_idx..]);
+            // construct client finished message
+            const c_finished = try tls13.finished.Finished.fromMessageBytes(self.hs_msg_buf_stream.getWritten(), self.key_sched.secret.c_hs_finished_secret.slice(), self.key_sched.hkdf);
+            const hs = tls13.handshake.Handshake{ .finished = c_finished };
+            const c_fin_len = try hs.encode(writeStream.writer());
+            std.debug.print("payload len ={}\n", .{c_fin_len});
+            buf_end_idx += c_fin_len;
+
+            cf.len.value = c_fin_len;
+            _ = cf.encodeToSliceWithoutData(self.send_buf[cf_start_idx..]);
+
+            const enc_end_idx = buf_end_idx;
+            buf_end_idx += Aes128Gcm.tag_length;
+            pkt.length.value = (buf_end_idx - buf_start_idx) - pkt.header_length();
+            _ = pkt.encodeToSlice(self.send_buf[buf_start_idx..], 4);
+
+            const hs_secret = try key.HandshakeSecret.generate(self.key_sched.secret.c_hs_secret.slice(), self.key_sched.secret.s_hs_secret.slice());
+            const nonce = packet.getNonce(@intCast(self.sent_pn + 1), hs_secret.client_secret.iv);
+            _ = aead.EasyAes128Gcm.encrypt(self.send_buf[enc_idx..], self.send_buf[enc_idx..enc_end_idx], self.send_buf[buf_start_idx..enc_idx], nonce, hs_secret.client_secret.key);
+
+            packet.lockHeaderProtection(self.send_buf[buf_start_idx..], pkt.header_length(), 4, pkt.sample, hs_secret.client_secret.hp);
 
             self.send_buf_end_idx = buf_end_idx;
 
@@ -369,11 +432,12 @@ pub fn ClientImpl(comptime PacketReaderWriter: anytype) type {
             }
             std.debug.print("DST_CON_ID={}\n", .{std.fmt.fmtSliceHexLower(pkt.lhp.destination_connection_id)});
             std.debug.print("PKT_SRC_CON_ID={}\n", .{std.fmt.fmtSliceHexLower(pkt.lhp.source_connection_id)});
-            const secret = try key.InitialSecret.generate(self.dst_con_id.slice());
+            self.init_secret = try key.InitialSecret.generate(self.dst_con_id.slice());
+            self.dst_con_id = try ConnectionID.fromSlice(pkt.lhp.source_connection_id);
 
             var pn_len: usize = 0;
             var pn: u32 = 0;
-            packet.unlockHeaderProtection(buf, pkt.protected_offset, &pn_len, &pn, pkt.sample, secret.server_secret.hp);
+            packet.unlockHeaderProtection(buf, pkt.protected_offset, &pn_len, &pn, pkt.sample, self.init_secret.server_secret.hp);
 
             // if the packet is newly recevied and first time to see,
             // update recv packet number
@@ -381,9 +445,9 @@ pub fn ClientImpl(comptime PacketReaderWriter: anytype) type {
                 self.largest_recv_pn = pn;
             }
 
-            const nonce = packet.getNonce(pn, secret.server_secret.iv);
+            const nonce = packet.getNonce(pn, self.init_secret.server_secret.iv);
             const payload = buf[pkt.protected_offset + pn_len .. pkt.protected_offset + pkt.length.value];
-            const plain = try aead.EasyAes128Gcm.decrypt(&self.crypto_buf, payload, buf[0 .. pkt.protected_offset + pn_len], nonce, secret.server_secret.key);
+            const plain = try aead.EasyAes128Gcm.decrypt(&self.crypto_buf, payload, buf[0 .. pkt.protected_offset + pn_len], nonce, self.init_secret.server_secret.key);
             try handlePacketPayload(self, plain);
         }
 
@@ -529,7 +593,7 @@ pub fn ClientImpl(comptime PacketReaderWriter: anytype) type {
                     std.debug.panic("unexpected TLS record: {}", .{hs_fin});
                 }
                 const fin = hs_fin.finished;
-                try self.handleHandshakeFinished(&fin);
+                try self.handleHandshakeFinished(&fin, self.key_sched.secret.s_hs_finished_secret.slice());
                 _ = try self.hs_msg_buf_stream.write(f.data[prev_pos..try readStream.getPos()]);
                 if (try readStream.getEndPos() != try readStream.getPos()) {
                     std.debug.panic("unexpected length read: expected={} actual={}", .{ try readStream.getEndPos(), try readStream.getPos() });
@@ -574,9 +638,10 @@ pub fn ClientImpl(comptime PacketReaderWriter: anytype) type {
             try sig.verify(verify_stream.getWritten(), pubkey.secp256r1.key);
         }
 
-        fn handleHandshakeFinished(self: *Self, fin: *const tls13.finished.Finished) !void {
-            _ = self;
-            _ = fin;
+        fn handleHandshakeFinished(self: *Self, fin: *const tls13.finished.Finished, secret: []const u8) !void {
+            if (!fin.verify(self.hs_msg_buf_stream.getWritten(), secret)) {
+                std.debug.panic("failed to verify server finished", .{});
+            }
         }
     };
 }
@@ -1474,17 +1539,17 @@ test "mock-based testing with quic-go" {
     try c.procNext();
     try expect(c.state == .HANDSHAKE_DONE);
 
-    //const pkt = try packet.InitialPacket.decodeFromSlice(c.pktRW.written[0..c.pktRW.written_size], false);
-    //const secret = try key.InitialSecret.generate(pkt.lhp.destination_connection_id);
-    //var pn_len: usize = 0;
-    //var pn: u32 = 0;
-    //packet.unlockHeaderProtection(c.pktRW.written[0..c.pktRW.written_size], pkt.protected_offset, &pn_len, &pn, pkt.sample, secret.client_secret.hp);
-    //try expect(pn_len == 4);
-    //try expect(pn == 2);
-    //const nonce = packet.getNonce(pn, secret.client_secret.iv);
-    //const payload = c.pktRW.written[pkt.protected_offset + pn_len .. pkt.header_length() + pkt.length.value];
-    //var m = [_]u8{0} ** 1500;
-    //std.debug.print("enc_idx={} nonce={} key={} payload={}\n", .{ pkt.protected_offset + pn_len, std.fmt.fmtSliceHexLower(&nonce), std.fmt.fmtSliceHexLower(&secret.client_secret.key), payload.len });
-    //const plain = try aead.EasyAes128Gcm.decrypt(&m, payload, c.pktRW.written[0 .. pkt.protected_offset + pn_len], nonce, secret.client_secret.key);
-    //_ = plain;
+    const pkt = try packet.InitialPacket.decodeFromSlice(c.pktRW.written[0..c.pktRW.written_size], false);
+    const secret = try key.InitialSecret.generate(pkt.lhp.destination_connection_id);
+    var pn_len: usize = 0;
+    var pn: u32 = 0;
+    packet.unlockHeaderProtection(c.pktRW.written[0..c.pktRW.written_size], pkt.protected_offset, &pn_len, &pn, pkt.sample, secret.client_secret.hp);
+    try expect(pn_len == 4);
+    try expect(pn == 2);
+    const nonce = packet.getNonce(pn, secret.client_secret.iv);
+    const payload = c.pktRW.written[pkt.protected_offset + pn_len .. pkt.header_length() + pkt.length.value];
+    var m = [_]u8{0} ** 1500;
+    std.debug.print("enc_idx={} nonce={} key={} payload={}\n", .{ pkt.protected_offset + pn_len, std.fmt.fmtSliceHexLower(&nonce), std.fmt.fmtSliceHexLower(&secret.client_secret.key), payload.len });
+    const plain = try aead.EasyAes128Gcm.decrypt(&m, payload, c.pktRW.written[0 .. pkt.protected_offset + pn_len], nonce, secret.client_secret.key);
+    _ = plain;
 }
