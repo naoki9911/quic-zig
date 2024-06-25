@@ -61,27 +61,30 @@ pub const VLI = struct {
         }
     }
 
-    pub fn encodeToSlice(self: Self, buf: []u8) usize {
+    pub fn encodeWithWriter(self: Self, writer: anytype) !usize {
         switch (self.length) {
             1 => {
                 const type_byte: u8 = @intCast(self.value & 0x3F);
-                buf[0] = type_byte;
+                try writer.writeByte(type_byte);
                 return 1;
             },
             2 => {
+                var buf = [_]u8{0} ** 2;
                 std.mem.writeInt(u16, buf[0..2], @intCast(self.value), .big);
                 buf[0] = (buf[0] & 0x3F) | (1 << 6);
-                return 2;
+                return try writer.write(&buf);
             },
             4 => {
+                var buf = [_]u8{0} ** 4;
                 std.mem.writeInt(u32, buf[0..4], @intCast(self.value), .big);
                 buf[0] = (buf[0] & 0x3F) | (2 << 6);
-                return 4;
+                return try writer.write(&buf);
             },
             8 => {
+                var buf = [_]u8{0} ** 8;
                 std.mem.writeInt(u64, buf[0..8], @intCast(self.value), .big);
                 buf[0] = (buf[0] & 0x3F) | (3 << 6);
-                return 8;
+                return try writer.write(&buf);
             },
             else => @panic("invalid length"),
         }
@@ -216,7 +219,7 @@ pub const LongHeaderPacket = struct {
         };
     }
 
-    pub fn encodeToSlice(self: Self, buf: []u8, tsb: u4) usize {
+    pub fn encodeToSlice(self: Self, buf: []u8, tsb: u4) !usize {
         var idx: usize = 0;
         buf[0] = 0x3 << 6;
         buf[0] = buf[0] | (@as(u8, @intFromEnum(self.packet_type)) << 4);
@@ -318,12 +321,14 @@ pub const InitialPacket = struct {
         };
     }
 
-    pub fn encodeToSlice(self: Self, buf: []u8, pn_len: u4) usize {
-        var idx = self.lhp.encodeToSlice(buf, pn_len - 1);
-        idx += self.token_length.encodeToSlice(buf[idx..]);
+    pub fn encodeToSlice(self: Self, buf: []u8, pn_len: u4) !usize {
+        var idx = try self.lhp.encodeToSlice(buf, pn_len - 1);
+        var stream = std.io.fixedBufferStream(buf[idx..]);
+        idx += try self.token_length.encodeWithWriter(stream.writer());
         std.mem.copyForwards(u8, buf[idx..], self.token);
         idx += self.token.len;
-        idx += self.length.encodeToSlice(buf[idx..]);
+        stream = std.io.fixedBufferStream(buf[idx..]);
+        idx += try self.length.encodeWithWriter(stream.writer());
 
         return idx;
     }
@@ -391,9 +396,10 @@ pub const HandshakePacket = struct {
         };
     }
 
-    pub fn encodeToSlice(self: Self, buf: []u8, pn_len: u4) usize {
-        var idx = self.lhp.encodeToSlice(buf, pn_len - 1);
-        idx += self.length.encodeToSlice(buf[idx..]);
+    pub fn encodeToSlice(self: Self, buf: []u8, pn_len: u4) !usize {
+        var idx = try self.lhp.encodeToSlice(buf, pn_len - 1);
+        var stream = std.io.fixedBufferStream(buf[idx..]);
+        idx += try self.length.encodeWithWriter(stream.writer());
 
         return idx;
     }
@@ -584,9 +590,9 @@ pub const Frame = union(FrameType) {
         }
     }
 
-    pub fn encodeToSlice(self: Self, buf: []u8) usize {
+    pub fn encodeToSlice(self: Self, buf: []u8) !usize {
         switch (self) {
-            inline else => |case| return case.encodeToSlice(buf),
+            inline else => |case| return try case.encodeToSlice(buf),
         }
     }
 
@@ -625,7 +631,7 @@ pub const PaddingFrame = struct {
         return Self{ .len = len };
     }
 
-    pub fn encodeToSlice(self: Self, buf: []u8) usize {
+    pub fn encodeToSlice(self: Self, buf: []u8) !usize {
         var i: usize = 0;
         while (i < self.len) : (i += 1) {
             buf[i] = 0;
@@ -714,10 +720,11 @@ pub const AckFrame = struct {
             };
         }
 
-        pub fn encodeToSlice(self: ECNCounts, buf: []u8) usize {
-            var idx = self.ECT0_count.encodeToSlice(buf);
-            idx += self.ECT1_count.encodeToSlice(buf[idx..]);
-            idx += self.ECN_CE_count.encodeToSlice(buf[idx..]);
+        pub fn encodeToSlice(self: ECNCounts, buf: []u8) !usize {
+            var stream = std.io.fixedBufferStream(buf);
+            var idx = try self.ECT0_count.encodeWithWriter(stream.writer());
+            idx += try self.ECT1_count.encodeWithWriter(stream.writer());
+            idx += try self.ECN_CE_count.encodeWithWriter(stream.writer());
 
             return idx;
         }
@@ -784,18 +791,19 @@ pub const AckFrame = struct {
         };
     }
 
-    pub fn encodeToSlice(self: Self, buf: []u8) usize {
+    pub fn encodeToSlice(self: Self, buf: []u8) !usize {
         var idx: usize = 0;
-        idx += self.frame_type_vli.encodeToSlice(buf);
-        idx += self.largest_acked.encodeToSlice(buf[idx..]);
-        idx += self.ack_delay.encodeToSlice(buf[idx..]);
-        idx += self.ack_range_count.encodeToSlice(buf[idx..]);
-        idx += self.first_ack_range.encodeToSlice(buf[idx..]);
+        var stream = std.io.fixedBufferStream(buf);
+        idx += try self.frame_type_vli.encodeWithWriter(stream.writer());
+        idx += try self.largest_acked.encodeWithWriter(stream.writer());
+        idx += try self.ack_delay.encodeWithWriter(stream.writer());
+        idx += try self.ack_range_count.encodeWithWriter(stream.writer());
+        idx += try self.first_ack_range.encodeWithWriter(stream.writer());
         std.mem.copyForwards(u8, buf[idx..], self.ack_range_data);
         idx += self.ack_range_data.len;
 
         if (self.frame_type == .ackECN) {
-            idx += self.ECN_counts.encodeToSlice(buf[idx..]);
+            idx += try self.ECN_counts.encodeToSlice(buf[idx..]);
         }
 
         return idx;
@@ -847,17 +855,18 @@ pub const CryptoFrame = struct {
         };
     }
 
-    pub fn encodeToSlice(self: Self, buf: []u8) usize {
-        const frame_length = self.encodeToSliceWithoutData(buf);
+    pub fn encodeToSlice(self: Self, buf: []u8) !usize {
+        const frame_length = try self.encodeToSliceWithoutData(buf);
         std.mem.copyForwards(u8, buf[frame_length .. frame_length + self.data.len], self.data);
         return frame_length + self.data.len;
     }
 
-    pub fn encodeToSliceWithoutData(self: Self, buf: []u8) usize {
+    pub fn encodeToSliceWithoutData(self: Self, buf: []u8) !usize {
         var frame_length: usize = 0;
-        frame_length += self.frame_type.encodeToSlice(buf);
-        frame_length += self.offset.encodeToSlice(buf[frame_length..]);
-        frame_length += self.len.encodeToSlice(buf[frame_length..]);
+        var stream = std.io.fixedBufferStream(buf);
+        frame_length += try self.frame_type.encodeWithWriter(stream.writer());
+        frame_length += try self.offset.encodeWithWriter(stream.writer());
+        frame_length += try self.len.encodeWithWriter(stream.writer());
         return frame_length;
     }
 
@@ -925,7 +934,7 @@ pub const NewConnectionIDFrame = struct {
         };
     }
 
-    pub fn encodeToSlice(self: Self, buf: []u8) usize {
+    pub fn encodeToSlice(self: Self, buf: []u8) !usize {
         _ = self;
         _ = buf;
         @panic("unimplemented");
@@ -964,11 +973,11 @@ pub const StreamFrame = struct {
         @panic("unimplemented");
     }
 
-    pub fn encodeToSlice(self: Self, buf: []u8) usize {
-        var idx: usize = self.frame_type.encodeToSlice(buf);
-        idx += self.stream_id.encodeToSlice(buf[idx..]);
-        std.mem.copyForwards(u8, buf[idx..], self.data);
-        idx += self.data.len;
+    pub fn encodeToSlice(self: Self, buf: []u8) !usize {
+        var stream = std.io.fixedBufferStream(buf);
+        var idx: usize = try self.frame_type.encodeWithWriter(stream.writer());
+        idx += try self.stream_id.encodeWithWriter(stream.writer());
+        idx += try stream.writer().write(self.data);
 
         return idx;
     }
@@ -997,7 +1006,7 @@ pub const RetireConnectionIDFrame = struct {
         @panic("unimplemented");
     }
 
-    pub fn encodeToSlice(self: Self, buf: []u8) usize {
+    pub fn encodeToSlice(self: Self, buf: []u8) !usize {
         var idx: usize = self.frame_type.encodeToSlice(buf);
         idx += self.seq_num.encodeToSlice(buf[idx..]);
 
@@ -1298,13 +1307,13 @@ test "parse Client Initial Packet" {
     try expect(std.mem.eql(u8, crypto_frame.data, buf[0..enc_len]));
 
     var send_buf = [_]u8{0} ** 1500;
-    const hdr_size = pkt.encodeToSlice(&send_buf, 4);
+    const hdr_size = try pkt.encodeToSlice(&send_buf, 4);
     std.mem.writeInt(u32, send_buf[hdr_size..][0..4], 2, .big);
     try expect(std.mem.eql(u8, send_buf[0 .. hdr_size + 4], client_msgs[0 .. hdr_size + 4]));
 
     var idx = hdr_size + 4;
-    idx += frame.encodeToSlice(send_buf[idx..]);
-    idx += frame2.encodeToSlice(send_buf[idx..]);
+    idx += try frame.encodeToSlice(send_buf[idx..]);
+    idx += try frame2.encodeToSlice(send_buf[idx..]);
     try expect(std.mem.eql(u8, send_buf[hdr_size + 4 .. idx], plain));
 
     const enc_res = aead.EasyAes128Gcm.encrypt(send_buf[hdr_size + 4 ..], send_buf[hdr_size + 4 .. idx], send_buf[0 .. hdr_size + 4], nonce, secret.client_secret.key);
@@ -1386,13 +1395,13 @@ test "parse Server Initial Packet" {
     try expect(std.mem.eql(u8, crypto_frame.data, buf[0..enc_len]));
 
     var send_buf = [_]u8{0} ** 1500;
-    const hdr_size = pkt.encodeToSlice(&send_buf, 2);
+    const hdr_size = try pkt.encodeToSlice(&send_buf, 2);
     std.mem.writeInt(u16, send_buf[hdr_size..][0..2], 1, .big);
     try expect(std.mem.eql(u8, send_buf[0 .. hdr_size + 2], server_msg[0 .. hdr_size + 2]));
 
     var idx = hdr_size + 2;
-    idx += frame.encodeToSlice(send_buf[idx..]);
-    idx += frame2.encodeToSlice(send_buf[idx..]);
+    idx += try frame.encodeToSlice(send_buf[idx..]);
+    idx += try frame2.encodeToSlice(send_buf[idx..]);
     try expect(std.mem.eql(u8, send_buf[hdr_size + 2 .. idx], plain));
 
     const enc_res = aead.EasyAes128Gcm.encrypt(send_buf[hdr_size + 2 ..], send_buf[hdr_size + 2 .. idx], send_buf[0 .. hdr_size + 2], nonce, secret.server_secret.key);

@@ -62,7 +62,7 @@ pub const InitialCryptoFrameBuilder = struct {
         };
         end_idx += enc_len;
         start_idx -= cf.header_length();
-        _ = cf.encodeToSliceWithoutData(buf[start_idx..]);
+        _ = try cf.encodeToSliceWithoutData(buf[start_idx..]);
 
         // for packet number
         // this denotes the tail of InitialPacket header.
@@ -94,11 +94,11 @@ pub const InitialCryptoFrameBuilder = struct {
         if (cur_payload_len < pkt.length.value) {
             const pad_len = pkt.length.value - cur_payload_len;
             const pad = packet.PaddingFrame.init(pad_len);
-            end_idx += pad.encodeToSlice(buf[end_idx..]);
+            end_idx += try pad.encodeToSlice(buf[end_idx..]);
         }
 
         start_idx -= pkt.header_length();
-        _ = pkt.encodeToSlice(buf[start_idx..], 4);
+        _ = try pkt.encodeToSlice(buf[start_idx..], 4);
 
         const secret = try key.InitialSecret.generate(pkt.lhp.destination_connection_id);
         const nonce = packet.getNonce(self.packet_number, secret.client_secret.iv);
@@ -418,7 +418,7 @@ pub fn ClientImpl(comptime PacketReaderWriter: anytype) type {
                 .frame_length = 0,
             };
             const enc_idx = buf_end_idx;
-            buf_end_idx += ackFrame.encodeToSlice(self.send_buf[buf_end_idx..]);
+            buf_end_idx += try ackFrame.encodeToSlice(self.send_buf[buf_end_idx..]);
 
             // current payload length + AES128GCM's tag length
             const cur_payload_len = (buf_end_idx - enc_idx) + Aes128Gcm.tag_length + 4;
@@ -427,10 +427,10 @@ pub fn ClientImpl(comptime PacketReaderWriter: anytype) type {
             if (cur_payload_len < pkt.length.value) {
                 const pad_len = pkt.length.value - cur_payload_len;
                 const pad = packet.PaddingFrame.init(pad_len);
-                buf_end_idx += pad.encodeToSlice(self.send_buf[buf_end_idx..]);
+                buf_end_idx += try pad.encodeToSlice(self.send_buf[buf_end_idx..]);
             }
 
-            _ = pkt.encodeToSlice(self.send_buf[buf_start_idx..], 4);
+            _ = try pkt.encodeToSlice(self.send_buf[buf_start_idx..], 4);
 
             const nonce = packet.getNonce(@intCast(self.sent_pn + 1), self.init_secret.client_secret.iv);
             _ = aead.EasyAes128Gcm.encrypt(self.send_buf[enc_idx..], self.send_buf[enc_idx..buf_end_idx], self.send_buf[buf_start_idx..enc_idx], nonce, self.init_secret.client_secret.key);
@@ -480,12 +480,12 @@ pub fn ClientImpl(comptime PacketReaderWriter: anytype) type {
                 .ECN_counts = undefined,
                 .frame_length = 0,
             };
-            buf_end_idx += ackFrame.encodeToSlice(self.send_buf[buf_end_idx..]);
+            buf_end_idx += try ackFrame.encodeToSlice(self.send_buf[buf_end_idx..]);
 
             const enc_end_idx = buf_end_idx;
             buf_end_idx += Aes128Gcm.tag_length;
             pkt.length.value = (buf_end_idx - buf_start_idx) - pkt.header_length();
-            _ = pkt.encodeToSlice(self.send_buf[buf_start_idx..], 4);
+            _ = try pkt.encodeToSlice(self.send_buf[buf_start_idx..], 4);
 
             const hs_secret = try key.HandshakeSecret.generate(self.key_sched.secret.c_hs_secret.slice(), self.key_sched.secret.s_hs_secret.slice());
             const nonce = packet.getNonce(@intCast(pn), hs_secret.client_secret.iv);
@@ -541,12 +541,12 @@ pub fn ClientImpl(comptime PacketReaderWriter: anytype) type {
             buf_end_idx += c_fin_len;
 
             cf.len.value = c_fin_len;
-            _ = cf.encodeToSliceWithoutData(self.send_buf[cf_start_idx..]);
+            _ = try cf.encodeToSliceWithoutData(self.send_buf[cf_start_idx..]);
 
             const enc_end_idx = buf_end_idx;
             buf_end_idx += Aes128Gcm.tag_length;
             pkt.length.value = (buf_end_idx - buf_start_idx) - pkt.header_length();
-            _ = pkt.encodeToSlice(self.send_buf[buf_start_idx..], 4);
+            _ = try pkt.encodeToSlice(self.send_buf[buf_start_idx..], 4);
 
             const hs_secret = try key.HandshakeSecret.generate(self.key_sched.secret.c_hs_secret.slice(), self.key_sched.secret.s_hs_secret.slice());
             const nonce = packet.getNonce(@intCast(0), hs_secret.client_secret.iv);
@@ -674,7 +674,7 @@ pub fn ClientImpl(comptime PacketReaderWriter: anytype) type {
                 .data = "hello",
             };
             const enc_start_idx = buf_end_idx;
-            buf_end_idx += sf.encodeToSlice(self.send_buf[buf_end_idx..]);
+            buf_end_idx += try sf.encodeToSlice(self.send_buf[buf_end_idx..]);
             const enc_end_idx = buf_end_idx;
 
             buf_end_idx += Aes128Gcm.tag_length;
