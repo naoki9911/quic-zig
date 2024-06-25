@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"time"
 
 	"github.com/quic-go/quic-go"
 )
@@ -39,13 +40,13 @@ func main() {
 		KeyLogWriter:       keyLog,
 	}
 
-	con, err := quic.DialAddr(context.TODO(), "localhost:4242", tlsConfig, nil)
+	con, err := quic.DialAddr(context.TODO(), "127.0.0.1:4242", tlsConfig, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println("Success to open connection")
 
-	stream, err := con.OpenStream()
+	stream, err := con.OpenStreamSync(context.TODO())
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -57,4 +58,11 @@ func main() {
 		log.Fatal(err)
 	}
 	fmt.Printf("Written %d bytes\n", writeSize)
+
+	err = stream.Close()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	time.Sleep(1 * time.Second)
 }

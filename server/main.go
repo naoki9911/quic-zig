@@ -38,7 +38,7 @@ func main() {
 	}
 	fmt.Println("Connection accepted")
 
-	stream, err := conn.AcceptStream(context.Background())
+	stream, err := conn.AcceptStream(context.TODO())
 	if err != nil {
 		log.Fatal("AcceptStream: ", err)
 	}

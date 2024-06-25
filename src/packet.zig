@@ -425,6 +425,7 @@ pub const ShortHeaderPacket = struct {
 
     spin_bit: u1,
     key_phase: u1,
+    pn_len: u8,
 
     /// Not owning
     destination_connection_id: []const u8,
@@ -449,6 +450,7 @@ pub const ShortHeaderPacket = struct {
 
         const spin_bit: u1 = @intCast(buf[idx] >> 5 & 0x1);
         const key_phase: u1 = @intCast(buf[idx] >> 2 & 0x1);
+        const pn_len = (buf[idx] & 0x3) + 1;
         idx += 1;
 
         if (dst_con_id_len > 20) {
@@ -461,17 +463,25 @@ pub const ShortHeaderPacket = struct {
         return Self{
             .spin_bit = spin_bit,
             .key_phase = key_phase,
+            .pn_len = pn_len,
             .destination_connection_id = dst_con_id,
             .sample = sample,
             .protected_offset = 1 + dst_con_id_len,
         };
     }
 
-    pub fn encodeToSlice(self: Self, buf: []u8, tsb: u4) usize {
-        _ = self;
-        _ = buf;
-        _ = tsb;
-        @panic("not implemented");
+    pub fn encodeToSlice(self: Self, buf: []u8) usize {
+        var idx: usize = 0;
+        buf[idx] = 0x1 << 6;
+        buf[idx] = buf[idx] | (@as(u8, self.spin_bit) << 5);
+        buf[idx] = buf[idx] | (@as(u8, self.key_phase) << 2);
+        buf[idx] = buf[idx] | ((self.pn_len - 1) & 0x3);
+        idx += 1;
+
+        std.mem.copyForwards(u8, buf[idx..], self.destination_connection_id);
+        idx += self.destination_connection_id.len;
+
+        return idx;
     }
 
     pub fn length(self: Self) usize {
@@ -927,6 +937,76 @@ pub const NewConnectionIDFrame = struct {
         len += self.retire_prior_to.length;
         len += 1 + self.con_id.len;
         len += self.stateless_reset_token.len;
+
+        return len;
+    }
+};
+
+/// RFC9000 19.8. STREAM Frames
+/// STREAM Frame {
+///   Type (i) = 0x08..0x0f,
+///   Stream ID (i),
+///   [Offset (i)],
+///   [Length (i)],
+///   Stream Data (..),
+/// }
+pub const StreamFrame = struct {
+    const Self = @This();
+
+    frame_type: VLI,
+    stream_id: VLI,
+
+    // not owing
+    data: []const u8,
+
+    pub fn decodeFromSlice(buf: []const u8) Self {
+        _ = buf;
+        @panic("unimplemented");
+    }
+
+    pub fn encodeToSlice(self: Self, buf: []u8) usize {
+        var idx: usize = self.frame_type.encodeToSlice(buf);
+        idx += self.stream_id.encodeToSlice(buf[idx..]);
+        std.mem.copyForwards(u8, buf[idx..], self.data);
+        idx += self.data.len;
+
+        return idx;
+    }
+
+    pub fn length(self: Self) usize {
+        var len: usize = self.frame_type.length;
+        len += self.stream_id.length;
+        len += self.data.len;
+
+        return len;
+    }
+};
+
+/// RETIRE_CONNECTION_ID Frame {
+///   Type (i) = 0x19,
+///   Sequence Number (i),
+/// }
+pub const RetireConnectionIDFrame = struct {
+    const Self = @This();
+
+    frame_type: VLI,
+    seq_num: VLI,
+
+    pub fn decodeFromSlice(buf: []const u8) Self {
+        _ = buf;
+        @panic("unimplemented");
+    }
+
+    pub fn encodeToSlice(self: Self, buf: []u8) usize {
+        var idx: usize = self.frame_type.encodeToSlice(buf);
+        idx += self.seq_num.encodeToSlice(buf[idx..]);
+
+        return idx;
+    }
+
+    pub fn length(self: Self) usize {
+        var len: usize = self.frame_type.length;
+        len += self.seq_num.length;
 
         return len;
     }
